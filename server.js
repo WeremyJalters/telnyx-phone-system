@@ -1,4 +1,15 @@
-import express from 'express';
+// Routes
+app.get('/', (req, res) => {
+    res.sendFile(join(__dirname, 'public', 'index.html'));
+});
+
+app.get('/api/stats', (req, res) => {
+    res.json(callStats);
+});
+
+app.get('/api/calls', (req, res) => {
+    res.json(callHistory.slice(-50)); // Return last 50 calls
+});import express from 'express';
 import bodyParser from 'body-parser';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -144,7 +155,7 @@ app.post('/webhooks/calls', async (req, res) => {
     res.status(200).send('OK');
 });
 
-// Handle incoming calls
+// Handle incoming calls - simplified without memory
 async function handleIncomingCall(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
     const fromNumber = data.payload?.from || data.from;
@@ -152,7 +163,7 @@ async function handleIncomingCall(data) {
 
     console.log('Handling incoming call:', callId, 'from', fromNumber, 'to', toNumber);
 
-    // Store call record with better error handling AND memory backup
+    // Store call record in database
     try {
         console.log('Attempting to insert call record into database...');
         
@@ -170,23 +181,7 @@ async function handleIncomingCall(data) {
         
     } catch (dbError) {
         console.error('Database error inserting call:', dbError);
-        console.error('Database error stack:', dbError.stack);
     }
-    
-    // ALWAYS store in memory as backup
-    const memoryCall = {
-        id: callId,
-        call_id: callId,
-        direction: 'inbound',
-        from_number: fromNumber,
-        to_number: toNumber,
-        status: 'initiated',
-        start_time: new Date().toISOString(),
-        call_type: 'customer_inquiry',
-        timestamp: new Date().toISOString()
-    };
-    callHistory.unshift(memoryCall);
-    console.log('Call stored in memory backup');
 
     try {
         // Answer the call using direct HTTP API
@@ -422,7 +417,7 @@ async function handleCallHangup(data) {
     }
 }
 
-// Handle recording saved with robust fallback
+// Handle recording saved - simplified
 async function handleRecordingSaved(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
     const recordingUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
@@ -432,28 +427,7 @@ async function handleRecordingSaved(data) {
     console.log('Recording URL:', recordingUrl);
     console.log('Recording ID:', recordingId);
     
-    // ALWAYS update memory first (guaranteed to work)
-    const memoryCall = callHistory.find(call => call.call_id === callId);
-    if (memoryCall) {
-        memoryCall.recording_url = recordingUrl;
-        memoryCall.recording_id = recordingId;
-        memoryCall.recordingUrl = recordingUrl; // alternative property name
-        console.log('Recording URL stored in memory backup');
-    } else {
-        // Create new memory entry if not found
-        callHistory.unshift({
-            id: callId,
-            call_id: callId,
-            recording_url: recordingUrl,
-            recording_id: recordingId,
-            recordingUrl: recordingUrl,
-            timestamp: new Date().toISOString(),
-            source: 'recording_webhook'
-        });
-        console.log('New recording entry created in memory');
-    }
-    
-    // Try to update database (may fail but recording is safe in memory)
+    // Try to update database
     try {
         await dbRun(`
             UPDATE calls 
@@ -468,7 +442,7 @@ async function handleRecordingSaved(data) {
         console.log('Updated call record:', updatedCall);
         
     } catch (error) {
-        console.error('Database update failed, but recording is safe in memory:', error);
+        console.error('Database update failed:', error);
     }
 
     // Generate transcript
@@ -632,21 +606,8 @@ app.get('/api/calls', async (req, res) => {
             
         } catch (dbError) {
             console.log('Database not working, using memory fallback:', dbError.message);
-            calls = callHistory.slice(0, limit);
+            calls = [];
         }
-        
-        // Enhance calls with memory data if available
-        calls = calls.map(call => {
-            const memoryCall = callHistory.find(mc => mc.id === call.call_id);
-            if (memoryCall && memoryCall.recordingUrl && !call.recording_url) {
-                return {
-                    ...call,
-                    recording_url: memoryCall.recordingUrl,
-                    recording_id: memoryCall.recordingId
-                };
-            }
-            return call;
-        });
         
         console.log('Final call details:', JSON.stringify(calls, null, 2));
         
@@ -661,8 +622,8 @@ app.get('/api/calls', async (req, res) => {
         res.status(500).json({ 
             error: error.message, 
             stack: error.stack,
-            calls: callHistory.slice(0, 10), // Emergency fallback
-            source: 'emergency_memory'
+            calls: [], // Simple fallback
+            source: 'error'
         });
     }
 });
@@ -1032,20 +993,14 @@ app.get('/api/debug/db', async (req, res) => {
     }
 });
 
-// Recordings endpoint - always works even if database fails
+// Recordings endpoint - simple fallback
 app.get('/api/recordings', (req, res) => {
     try {
-        const recordings = callHistory.filter(call => call.recordingUrl).map(call => ({
-            callId: call.id,
-            recordingUrl: call.recordingUrl,
-            recordingId: call.recordingId,
-            timestamp: call.timestamp
-        }));
-        
         res.json({
-            recordings: recordings,
-            count: recordings.length,
-            source: 'memory',
+            recordings: [],
+            count: 0,
+            source: 'disabled',
+            message: 'Memory storage disabled for stability',
             timestamp: new Date().toISOString()
         });
     } catch (error) {
