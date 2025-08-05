@@ -1,56 +1,52 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { promises as fs } from 'fs';
-import path from 'path';
-import sqlite3 from 'sqlite3';
-import { promisify } from 'util';
-import Telnyx from 'telnyx';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import pkg from 'pg';
+const { Pool } = pkg;
 
-// Initialize Telnyx with your API key
-const telnyx = new Telnyx(process.env.TELNYX_API_KEY);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const app = express();
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+const PORT = process.env.PORT || 3000;
 
-// Initialize SQLite database with persistent file
-const dbPath = process.env.DATABASE_PATH || './call_records.db';
-console.log('Database path:', dbPath);
+// Initialize PostgreSQL connection
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/telnyx_calls',
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
-const db = new sqlite3.Database(dbPath, (err) => {
+console.log('Database connection configured for:', process.env.DATABASE_URL ? 'Production PostgreSQL' : 'Local PostgreSQL');
+
+// Test database connection
+pool.query('SELECT NOW()', (err, result) => {
     if (err) {
-        console.error('Error opening database:', err);
+        console.error('Database connection error:', err);
     } else {
-        console.log('Connected to SQLite database at:', dbPath);
+        console.log('Database connected successfully at:', result.rows[0].now);
     }
 });
 
-// Enable WAL mode for better concurrency
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA synchronous = NORMAL;');
-db.exec('PRAGMA cache_size = 1000;');
-db.exec('PRAGMA temp_store = memory;');
-
-// Promisify database methods
-const dbRun = promisify(db.run.bind(db));
-const dbAll = promisify(db.all.bind(db));
-const dbGet = promisify(db.get.bind(db));
+// Middleware
+app.use(express.json());
+app.use(express.static(join(__dirname, 'public')));
 
 // Initialize database tables
 async function initDatabase() {
-    console.log('Initializing database tables...');
+    console.log('Initializing PostgreSQL database tables...');
     
     try {
-        await dbRun(`
+        await dbQuery(`
             CREATE TABLE IF NOT EXISTS calls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 call_id TEXT UNIQUE,
                 direction TEXT,
                 from_number TEXT,
                 to_number TEXT,
                 status TEXT,
-                start_time DATETIME,
-                end_time DATETIME,
+                start_time TIMESTAMPTZ,
+                end_time TIMESTAMPTZ,
                 duration INTEGER,
                 recording_url TEXT,
                 transcript TEXT,
@@ -58,14 +54,14 @@ async function initDatabase() {
                 customer_info TEXT,
                 contractor_info TEXT,
                 notes TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         `);
         console.log('Calls table initialized');
         
-        await dbRun(`
+        await dbQuery(`
             CREATE TABLE IF NOT EXISTS customers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 phone_number TEXT UNIQUE,
                 name TEXT,
                 address TEXT,
@@ -73,14 +69,14 @@ async function initDatabase() {
                 urgency TEXT,
                 notes TEXT,
                 status TEXT DEFAULT 'new',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         `);
         console.log('Customers table initialized');
         
-        await dbRun(`
+        await dbQuery(`
             CREATE TABLE IF NOT EXISTS contractors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 phone_number TEXT UNIQUE,
                 name TEXT,
                 company TEXT,
@@ -89,14 +85,10 @@ async function initDatabase() {
                 rating REAL,
                 availability TEXT,
                 notes TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         `);
         console.log('Contractors table initialized');
-        
-        // Verify table creation
-        const tables = await dbAll("SELECT name FROM sqlite_master WHERE type='table'");
-        console.log('Database tables created:', tables.map(t => t.name));
         
         // Check existing data
         const existingCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
@@ -158,16 +150,20 @@ async function handleIncomingCall(data) {
     try {
         console.log('Attempting to insert call record into database...');
         
-        const result = await dbRun(`
-            INSERT OR REPLACE INTO calls 
+        const result = await dbQuery(`
+            INSERT INTO calls 
             (call_id, direction, from_number, to_number, status, start_time, call_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (call_id) DO UPDATE SET
+            status = EXCLUDED.status,
+            start_time = EXCLUDED.start_time
+            RETURNING id
         `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
         
-        console.log('Call record inserted successfully. Row ID:', result);
+        console.log('Call record inserted successfully. Row ID:', result.rows[0].id);
         
         // Verify the insert worked
-        const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = $1', [callId]);
         console.log('Verified inserted call:', insertedCall);
         
     } catch (dbError) {
@@ -420,20 +416,59 @@ async function handleRecordingSaved(data) {
     console.log('Recording ID:', recordingId);
     
     try {
-        await dbRun(`
-            UPDATE calls 
-            SET recording_url = ?
-            WHERE call_id = ?
-        `, [recordingUrl, callId]);
+        // Try multiple update approaches to handle database connection issues
+        let updateResult;
+        let updatedCall;
+        
+        // First attempt with PostgreSQL syntax (if we migrate)
+        try {
+            updateResult = await dbQuery(`
+                UPDATE calls 
+                SET recording_url = $1
+                WHERE call_id = $2
+                RETURNING *
+            `, [recordingUrl, callId]);
+            updatedCall = updateResult.rows[0];
+        } catch (pgError) {
+            console.log('PostgreSQL update failed, trying SQLite syntax...');
+            
+            // Fallback to SQLite syntax  
+            updateResult = await dbRun(`
+                UPDATE calls 
+                SET recording_url = ?
+                WHERE call_id = ?
+            `, [recordingUrl, callId]);
+            
+            // Verify SQLite update
+            updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        }
         
         console.log('Database updated with recording URL');
-        
-        // Verify the update worked
-        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Updated call record:', updatedCall);
+        
+        // If database update failed, store in memory as backup
+        if (!updatedCall) {
+            console.log('Database update failed, storing in memory backup...');
+            callHistory.forEach(call => {
+                if (call.id === callId) {
+                    call.recordingUrl = recordingUrl;
+                    call.recordingId = recordingId;
+                }
+            });
+        }
         
     } catch (error) {
         console.error('Error updating call with recording URL:', error);
+        
+        // Fallback: store in memory
+        console.log('Using memory fallback for recording...');
+        const memoryCall = {
+            id: callId,
+            recordingUrl: recordingUrl,
+            recordingId: recordingId,
+            timestamp: new Date().toISOString()
+        };
+        callHistory.unshift(memoryCall);
     }
 
     // Generate transcript
@@ -563,7 +598,7 @@ app.post('/api/three-way-call', async (req, res) => {
     }
 });
 
-// Get call records
+// Get call records with recording fallback
 app.get('/api/calls', async (req, res) => {
     try {
         const { limit = 50, offset = 0, type } = req.query;
@@ -571,31 +606,64 @@ app.get('/api/calls', async (req, res) => {
         // First check if database connection is working
         console.log('API calls endpoint hit - checking database...');
         
-        // Test database connection
-        const testQuery = await dbGet('SELECT COUNT(*) as count FROM calls');
-        console.log('Database test - total calls:', testQuery);
+        let calls = [];
+        let databaseWorking = false;
         
-        let query = 'SELECT * FROM calls';
-        let params = [];
+        try {
+            // Test database connection
+            const testQuery = await dbGet('SELECT COUNT(*) as count FROM calls');
+            console.log('Database test - total calls:', testQuery);
+            
+            let query = 'SELECT * FROM calls';
+            let params = [];
 
-        if (type) {
-            query += ' WHERE call_type = ?';
-            params.push(type);
+            if (type) {
+                query += ' WHERE call_type = ?';
+                params.push(type);
+            }
+
+            query += ' ORDER BY start_time DESC LIMIT ? OFFSET ?';
+            params.push(parseInt(limit), parseInt(offset));
+            
+            console.log('Executing query:', query, 'with params:', params);
+            calls = await dbAll(query, params);
+            console.log('Query result - found calls:', calls.length);
+            databaseWorking = true;
+            
+        } catch (dbError) {
+            console.log('Database not working, using memory fallback:', dbError.message);
+            calls = callHistory.slice(0, limit);
         }
-
-        query += ' ORDER BY start_time DESC LIMIT ? OFFSET ?';
-        params.push(parseInt(limit), parseInt(offset));
         
-        console.log('Executing query:', query, 'with params:', params);
-        const calls = await dbAll(query, params);
-        console.log('Query result - found calls:', calls.length);
-        console.log('Call details:', JSON.stringify(calls, null, 2));
+        // Enhance calls with memory data if available
+        calls = calls.map(call => {
+            const memoryCall = callHistory.find(mc => mc.id === call.call_id);
+            if (memoryCall && memoryCall.recordingUrl && !call.recording_url) {
+                return {
+                    ...call,
+                    recording_url: memoryCall.recordingUrl,
+                    recording_id: memoryCall.recordingId
+                };
+            }
+            return call;
+        });
         
-        res.json(calls);
+        console.log('Final call details:', JSON.stringify(calls, null, 2));
+        
+        res.json({
+            calls: calls,
+            source: databaseWorking ? 'database' : 'memory',
+            timestamp: new Date().toISOString()
+        });
     } catch (error) {
         console.error('Error in /api/calls endpoint:', error);
         console.error('Error stack:', error.stack);
-        res.status(500).json({ error: error.message, stack: error.stack });
+        res.status(500).json({ 
+            error: error.message, 
+            stack: error.stack,
+            calls: callHistory.slice(0, 10), // Emergency fallback
+            source: 'emergency_memory'
+        });
     }
 });
 
@@ -950,14 +1018,38 @@ app.get('/api/debug/db', async (req, res) => {
             totalCalls: totalCalls.count,
             calls: allCalls,
             schema: schema,
+            memoryBackup: callHistory,
             timestamp: new Date().toISOString()
         });
     } catch (error) {
         console.error('Database debug error:', error);
         res.status(500).json({ 
             error: error.message, 
-            stack: error.stack 
+            stack: error.stack,
+            memoryBackup: callHistory,
+            message: 'Database unavailable, showing memory backup'
         });
+    }
+});
+
+// Recordings endpoint - always works even if database fails
+app.get('/api/recordings', (req, res) => {
+    try {
+        const recordings = callHistory.filter(call => call.recordingUrl).map(call => ({
+            callId: call.id,
+            recordingUrl: call.recordingUrl,
+            recordingId: call.recordingId,
+            timestamp: call.timestamp
+        }));
+        
+        res.json({
+            recordings: recordings,
+            count: recordings.length,
+            source: 'memory',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
