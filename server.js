@@ -78,9 +78,12 @@ const conferenceRooms = new Map();
 
 // Webhook handler for incoming calls
 app.post('/webhooks/calls', async (req, res) => {
+    console.log('Raw webhook received:', JSON.stringify(req.body, null, 2));
+    
     const { data } = req.body;
     const callId = data.payload?.call_control_id || data.call_control_id;
-    console.log('Webhook received:', data.event_type, callId);
+    console.log('Webhook received:', data.event_type, 'CallID:', callId);
+    console.log('Payload:', JSON.stringify(data.payload, null, 2));
 
     try {
         switch (data.event_type) {
