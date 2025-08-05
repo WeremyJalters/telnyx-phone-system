@@ -1,15 +1,4 @@
-// Routes
-app.get('/', (req, res) => {
-    res.sendFile(join(__dirname, 'public', 'index.html'));
-});
-
-app.get('/api/stats', (req, res) => {
-    res.json(callStats);
-});
-
-app.get('/api/calls', (req, res) => {
-    res.json(callHistory.slice(-50)); // Return last 50 calls
-});import express from 'express';
+import express from 'express';
 import bodyParser from 'body-parser';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -120,6 +109,15 @@ async function initDatabase() {
 // Call state management
 const activeCalls = new Map();
 const conferenceRooms = new Map();
+
+// Routes
+app.get('/', (req, res) => {
+    res.sendFile(join(__dirname, 'public', 'index.html'));
+});
+
+app.get('/api/stats', (req, res) => {
+    res.json(callStats);
+});
 
 // Webhook handler for incoming calls
 app.post('/webhooks/calls', async (req, res) => {
@@ -286,12 +284,7 @@ async function handleDTMF(data) {
     switch (digit) {
         case '1':
             // Emergency - immediate connection
-            await telnyx.calls.speak({
-                call_control_id: callId,
-                payload: "This is an emergency roofing call. Please hold while we connect you with an available contractor for immediate assistance.",
-                voice: 'female',
-                language: 'en-US'
-            });
+            await speakToCall(callId, "This is an emergency roofing call. Please hold while we connect you with an available contractor for immediate assistance.");
             // Find and call emergency contractor
             await connectToEmergencyContractor(callId);
             break;
@@ -301,29 +294,64 @@ async function handleDTMF(data) {
             break;
         case '0':
             // Speak with representative
-            await telnyx.calls.speak({
-                call_control_id: callId,
-                payload: "Please hold while we connect you with a Weather Pro Solutions representative.",
-                voice: 'female',
-                language: 'en-US'
-            });
+            await speakToCall(callId, "Please hold while we connect you with a Weather Pro Solutions representative.");
             // You would implement your logic to connect to your team
             break;
     }
 }
 
+// Helper function to speak to a call
+async function speakToCall(callId, message) {
+    try {
+        const response = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                payload: message,
+                voice: 'female',
+                language: 'en-US'
+            })
+        });
+        
+        if (!response.ok) {
+            console.error('Failed to speak to call:', response.status);
+        }
+    } catch (error) {
+        console.error('Error speaking to call:', error);
+    }
+}
+
 // Collect customer information
 async function collectCustomerInfo(callId) {
-    await telnyx.calls.gatherUsingSpeak({
-        call_control_id: callId,
-        payload: "Please describe your roofing project or issue after the beep. Include your address and type of service needed. Press pound when finished.",
-        voice: 'female',
-        language: 'en-US',
-        minimum_digits: 0,
-        maximum_digits: 0,
-        timeout_millis: 30000,
-        terminating_digit: '#'
-    });
+    try {
+        const response = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/gather_using_speak`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                payload: "Please describe your roofing project or issue after the beep. Include your address and type of service needed. Press pound when finished.",
+                voice: 'female',
+                language: 'en-US',
+                minimum_digits: 0,
+                maximum_digits: 0,
+                timeout_millis: 30000,
+                terminating_digit: '#'
+            })
+        });
+        
+        if (!response.ok) {
+            console.error('Failed to gather customer info:', response.status);
+        }
+    } catch (error) {
+        console.error('Error gathering customer info:', error);
+    }
 }
 
 // Connect to emergency contractor
@@ -339,12 +367,7 @@ async function connectToEmergencyContractor(callId) {
         `);
 
         if (!contractor) {
-            await telnyx.calls.speak({
-                call_control_id: callId,
-                payload: "I apologize, but no emergency contractors are currently available. We are connecting you to our on-call service.",
-                voice: 'female',
-                language: 'en-US'
-            });
+            await speakToCall(callId, "I apologize, but no emergency contractors are currently available. We are connecting you to our on-call service.");
             return;
         }
 
@@ -356,37 +379,61 @@ async function connectToEmergencyContractor(callId) {
             created: new Date()
         });
 
-        // Add customer to conference
-        await telnyx.calls.transfer({
-            call_control_id: callId,
-            to: `conference:${conferenceId}`
+        // Transfer customer to conference
+        const transferResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/transfer`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                to: `conference:${conferenceId}`
+            })
         });
+
+        if (!transferResponse.ok) {
+            console.error('Failed to transfer to conference:', transferResponse.status);
+            return;
+        }
 
         // Call contractor
-        const contractorCall = await telnyx.calls.create({
-            to: contractor.phone_number,
-            from: process.env.TELNYX_PHONE_NUMBER,
-            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        const contractorCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                to: contractor.phone_number,
+                from: process.env.TELNYX_PHONE_NUMBER,
+                webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+            })
         });
 
-        // Store contractor call info
-        await dbRun(`
-            INSERT INTO calls 
-            (call_id, direction, from_number, to_number, status, start_time, call_type, contractor_info)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, 
-        [
-            contractorCall.data.call_control_id,
-            'outbound',
-            process.env.TELNYX_PHONE_NUMBER,
-            contractor.phone_number,
-            'initiated',
-            new Date().toISOString(),
-            'contractor_connect',
-            JSON.stringify(contractor)
-        ]);
+        if (contractorCallResponse.ok) {
+            const contractorCall = await contractorCallResponse.json();
+            
+            // Store contractor call info
+            await dbRun(`
+                INSERT INTO calls 
+                (call_id, direction, from_number, to_number, status, start_time, call_type, contractor_info)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `, 
+            [
+                contractorCall.data.call_control_id,
+                'outbound',
+                process.env.TELNYX_PHONE_NUMBER,
+                contractor.phone_number,
+                'initiated',
+                new Date().toISOString(),
+                'contractor_connect',
+                JSON.stringify(contractor)
+            ]);
 
-        conferenceRooms.get(conferenceId).contractor = contractorCall.data.call_control_id;
+            conferenceRooms.get(conferenceId).contractor = contractorCall.data.call_control_id;
+        }
 
     } catch (error) {
         console.error('Error connecting to contractor:', error);
@@ -469,11 +516,25 @@ async function generateTranscript(callId, recordingUrl) {
 app.post('/api/call-customer', async (req, res) => {
     try {
         const { customerNumber, message } = req.body;
-        const call = await telnyx.calls.create({
-            to: customerNumber,
-            from: process.env.TELNYX_PHONE_NUMBER,
-            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        const callResponse = await fetch('https://api.telnyx.com/v2/calls', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                to: customerNumber,
+                from: process.env.TELNYX_PHONE_NUMBER,
+                webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+            })
         });
+
+        if (!callResponse.ok) {
+            throw new Error(`Failed to create call: ${callResponse.status}`);
+        }
+
+        const call = await callResponse.json();
 
         // Store call record
         await dbRun(`
@@ -502,11 +563,25 @@ app.post('/api/call-customer', async (req, res) => {
 app.post('/api/call-contractor', async (req, res) => {
     try {
         const { contractorNumber, jobDetails } = req.body;
-        const call = await telnyx.calls.create({
-            to: contractorNumber,
-            from: process.env.TELNYX_PHONE_NUMBER,
-            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        const callResponse = await fetch('https://api.telnyx.com/v2/calls', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                to: contractorNumber,
+                from: process.env.TELNYX_PHONE_NUMBER,
+                webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+            })
         });
+
+        if (!callResponse.ok) {
+            throw new Error(`Failed to create call: ${callResponse.status}`);
+        }
+
+        const call = await callResponse.json();
 
         await dbRun(`
             INSERT INTO calls 
@@ -540,18 +615,41 @@ app.post('/api/three-way-call', async (req, res) => {
         const conferenceId = `conf_${Date.now()}`;
 
         // Call customer
-        const customerCall = await telnyx.calls.create({
-            to: customerNumber,
-            from: process.env.TELNYX_PHONE_NUMBER,
-            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        const customerCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                to: customerNumber,
+                from: process.env.TELNYX_PHONE_NUMBER,
+                webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+            })
         });
 
         // Call contractor
-        const contractorCall = await telnyx.calls.create({
-            to: contractorNumber,
-            from: process.env.TELNYX_PHONE_NUMBER,
-            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        const contractorCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                to: contractorNumber,
+                from: process.env.TELNYX_PHONE_NUMBER,
+                webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+            })
         });
+
+        if (!customerCallResponse.ok || !contractorCallResponse.ok) {
+            throw new Error('Failed to create conference calls');
+        }
+
+        const customerCall = await customerCallResponse.json();
+        const contractorCall = await contractorCallResponse.json();
 
         // Store conference info
         conferenceRooms.set(conferenceId, {
@@ -864,7 +962,8 @@ app.get('/calls', (req, res) => {
             
             try {
                 const response = await fetch('/api/calls');
-                const calls = await response.json();
+                const data = await response.json();
+                const calls = data.calls || [];
                 
                 if (calls.length === 0) {
                     callsList.innerHTML = '<div class="no-calls">No call records found</div>';
@@ -979,7 +1078,6 @@ app.get('/api/debug/db', async (req, res) => {
             totalCalls: totalCalls.count,
             calls: allCalls,
             schema: schema,
-            memoryBackup: callHistory,
             timestamp: new Date().toISOString()
         });
     } catch (error) {
@@ -987,8 +1085,7 @@ app.get('/api/debug/db', async (req, res) => {
         res.status(500).json({ 
             error: error.message, 
             stack: error.stack,
-            memoryBackup: callHistory,
-            message: 'Database unavailable, showing memory backup'
+            message: 'Database unavailable'
         });
     }
 });
