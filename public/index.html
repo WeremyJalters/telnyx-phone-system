@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lead Generation Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+        }
+
+        .header {
+            background: #2c3e50;
+            color: white;
+            padding: 1rem 2rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            border-left: 4px solid #3498db;
+        }
+
+        .stat-card h3 {
+            color: #666;
+            font-size: 0.9rem;
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stat-card .value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 2rem;
+        }
+
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .card-header {
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #eee;
+            background: #f8f9fa;
+        }
+
+        .card-header h2 {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        .card-content {
+            padding: 1.5rem;
+        }
+
+        .call-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .call-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            border-bottom: 1px solid #eee;
+            transition: background-color 0.2s;
+        }
+
+        .call-item:hover {
+            background: #f8f9fa;
+        }
+
+        .call-info h4 {
+            font-size: 0.9rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .call-info p {
+            color: #666;
+            font-size: 0.8rem;
+        }
+
+        .call-status {
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .status-completed { background: #d4edda; color: #155724; }
+        .status-active { background: #d1ecf1; color: #0c5460; }
+        .status-missed { background: #f8d7da; color: #721c24; }
+
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 4px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+            display: inline-block;
+            text-align: center;
+        }
+
+        .btn-primary {
+            background: #3498db;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #2980b9;
+        }
+
+        .btn-success {
+            background: #27ae60;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #219a52;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 0.9rem;
+        }
+
+        .form-group textarea {
+            height: 100px;
+            resize: vertical;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+        }
+
+        .modal-content {
+            background: white;
+            margin: 5% auto;
+            padding: 2rem;
+            width: 90%;
+            max-width: 500px;
+            border-radius: 8px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .close {
+            float: right;
+            font-size: 1.5rem;
+            font-weight: bold;
+            cursor: pointer;
+            color: #999;
+        }
+
+        .close:hover {
+            color: #333;
+        }
+
+        .activity-feed {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .activity-item {
+            padding: 0.75rem;
+            border-bottom: 1px solid #eee;
+        }
+
+        .activity-time {
+            color: #666;
+            font-size: 0.8rem;
+        }
+
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            .container {
+                padding: 1rem;
+            }
+            
+            .btn-group {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Flood Restoration Lead Generation</h1>
+    </div>
+
+    <div class="container">
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Total Calls Today</h3>
+                <div class="value" id="todayCalls">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>Active Calls</h3>
+                <div class="value" id="activeCalls">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>Total Customers</h3>
+                <div class="value" id="totalCustomers">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>Total Contractors</h3>
+                <div class="value" id="totalContractors">0</div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="card">
+                <div class="card-header">
+                    <h2>Recent Calls</h2>
+                </div>
+                <div class="card-content">
+                    <div class="btn-group">
+                        <button class="btn btn-primary" onclick="openModal('callCustomerModal')">Call Customer</button>
+                        <button class="btn btn-primary" onclick="openModal('callContractorModal')">Call Contractor</button>
+                        <button class="btn btn-success" onclick="openModal('threeWayModal')">3-Way Call</button>
+                    </div>
+                    <div class="call-list" id="callList">
+                        <!-- Call list will be populated here -->
+                    </div>
+                </div>
+            </div>
+
+            <div>
+                <div class="card" style="margin-bottom: 1rem;">
+                    <div class="card-header">
+                        <h2>Quick Actions</h2>
+                    </div>
+                    <div class="card-content">
+                        <button class="btn btn-primary" onclick="openModal('addCustomerModal')" style="width: 100%; margin-bottom: 0.5rem;">Add Customer</button>
+                        <button class="btn btn-primary" onclick="openModal('addContractorModal')" style="width: 100%;">Add Contractor</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Recent Activity</h2>
+                    </div>
+                    <div class="card-content">
+                        <div class="activity-feed" id="activityFeed">
+                            <!-- Activity feed will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modals -->
+    <div id="callCustomerModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('callCustomerModal')">&times;</span>
+            <h2>Call Customer</h2>
+            <form id="callCustomerForm">
+                <div class="form-group">
+                    <label>Customer Phone Number</label>
+                    <input type="tel" id="customerPhone" required>
+                </div>
+                <div class="form-group">
+                    <label>Message/Notes</label>
+                    <textarea id="customerMessage" placeholder="Optional message or notes about this call"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Make Call</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="callContractorModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('callContractorModal')">&times;</span>
+            <h2>Call Contractor</h2>
+            <form id="callContractorForm">
+                <div class="form-group">
+                    <label>Contractor Phone Number</label>
+                    <input type="tel" id="contractorPhone" required>
+                </div>
+                <div class="form-group">
+                    <label>Job Details</label>
+                    <textarea id="jobDetails" placeholder="Details about the job/lead"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Make Call</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="threeWayModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('threeWayModal')">&times;</span>
+            <h2>Create 3-Way Call</h2>
+            <form id="threeWayForm">
+                <div class="form-group">
+                    <label>Customer Phone Number</label>
+                    <input type="tel" id="threeWayCustomer" required>
+                </div>
+                <div class="form-group">
+                    <label>Contractor Phone Number</label>
+                    <input type="tel" id="threeWayContractor" required>
+                </div>
+                <button type="submit" class="btn btn-success">Start 3-Way Call</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="addCustomerModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('addCustomerModal')">&times;</span>
+            <h2>Add Customer</h2>
+            <form id="addCustomerForm">
+                <div class="form-group">
+                    <label>Phone Number</label>
+                    <input type="tel" id="newCustomerPhone" required>
+                </div>
+                <div class="form-group">
+                    <label>Name</label>
+                    <input type="text" id="newCustomerName">
+                </div>
+                <div class="form-group">
+                    <label>Address</label>
+                    <input type="text" id="newCustomerAddress">
+                </div>
+                <div class="form-group">
+                    <label>Damage Type</label>
+                    <select id="newCustomerDamage">
+                        <option value="">Select type</option>
+                        <option value="flood">Flood</option>
+                        <option value="water">Water Damage</option>
+                        <option value="mold">Mold</option>
+                        <option value="fire">Fire & Smoke</option>
+                        <option value="storm">Storm Damage</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Urgency</label>
+                    <select id="newCustomerUrgency">
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="emergency">Emergency</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Notes</label>
+                    <textarea id="newCustomerNotes"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Add Customer</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="addContractorModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('addContractorModal')">&times;</span>
+            <h2>Add Contractor</h2>
+            <form id="addContractorForm">
+                <div class="form-group">
+                    <label>Phone Number</label>
+                    <input type="tel" id="newContractorPhone" required>
+                </div>
+                <div class="form-group">
+                    <label>Name</label>
+                    <input type="text" id="newContractorName">
+                </div>
+                <div class="form-group">
+                    <label>Company</label>
+                    <input type="text" id="newContractorCompany">
+                </div>
+                <div class="form-group">
+                    <label>Service Area</label>
+                    <input type="text" id="newContractorArea" placeholder="e.g., Miami-Dade County">
+                </div>
+                <div class="form-group">
+                    <label>Specialties</label>
+                    <input type="text" id="newContractorSpecialties" placeholder="e.g., flood, water damage, mold">
+                </div>
+                <div class="form-group">
+                    <label>Rating (1-5)</label>
+                    <input type="number" id="newContractorRating" min="1" max="5" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>Availability</label>
+                    <select id="newContractorAvailability">
+                        <option value="available">Available</option>
+                        <option value="busy">Busy</option>
+                        <option value="unavailable">Unavailable</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Notes</label>
+                    <textarea id="newContractorNotes"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Add Contractor</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // Dashboard functionality
+        async function loadDashboard() {
+            try {
+                const response = await fetch('/api/dashboard');
+                const data = await response.json();
+                
+                document.getElementById('todayCalls').textContent = data.todayCalls;
+                document.getElementById('activeCalls').textContent = data.activeCalls;
+                document.getElementById('totalCustomers').textContent = data.totalCustomers;
+                document.getElementById('totalContractors').textContent = data.totalContractors;
+            } catch (error) {
+                console.error('Error loading dashboard:', error);
+            }
+        }
+
+        async function loadCalls() {
+            try {
+                const response = await fetch('/api/calls?limit=10');
+                const calls = await response.json();
+                
+                const callList = document.getElementById('callList');
+                callList.innerHTML = '';
+                
+                calls.forEach(call => {
+                    const callItem = document.createElement('div');
+                    callItem.className = 'call-item';
+                    
+                    const statusClass = call.status === 'completed' ? 'status-completed' : 
+                                       call.status === 'answered' ? 'status-active' : 'status-missed';
+                    
+                    const duration = call.duration ? `${Math.floor(call.duration / 60)}:${(call.duration % 60).toString().padStart(2, '0')}` : '';
+                    
+                    callItem.innerHTML = `
+                        <div class="call-info">
+                            <h4>${call.from_number} → ${call.to_number}</h4>
+                            <p>${call.call_type} • ${new Date(call.start_time).toLocaleString()} ${duration ? `• ${duration}` : ''}</p>
+                        </div>
+                        <span class="call-status ${statusClass}">${call.status}</span>
+                    `;
+                    
+                    callList.appendChild(callItem);
+                });
+            } catch (error) {
+                console.error('Error loading calls:', error);
+            }
+        }
+
+        // Modal functions
+        function openModal(modalId) {
+            document.getElementById(modalId).style.display = 'block';
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).style.display = 'none';
+        }
+
+        // Form handlers
+        document.getElementById('callCustomerForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const customerNumber = document.getElementById('customerPhone').value;
+            const message = document.getElementById('customerMessage').value;
+            
+            try {
+                const response = await fetch('/api/call-customer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ customerNumber, message })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Call initiated successfully!');
+                    closeModal('callCustomerModal');
+                    loadCalls();
+                    loadDashboard();
+                } else {
+                    alert('Error initiating call: ' + result.error);
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        });
+
+        document.getElementById('callContractorForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const contractorNumber = document.getElementById('contractorPhone').value;
+            const jobDetails = document.getElementById('jobDetails').value;
+            
+            try {
+                const response = await fetch('/api/call-contractor', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ contractorNumber, jobDetails })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Call initiated successfully!');
+                    closeModal('callContractorModal');
+                    loadCalls();
+                    loadDashboard();
+                } else {
+                    alert('Error initiating call: ' + result.error);
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        });
+
+        document.getElementById('threeWayForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const customerNumber = document.getElementById('threeWayCustomer').value;
+            const contractorNumber = document.getElementById('threeWayContractor').value;
+            
+            try {
+                const response = await fetch('/api/three-way-call', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ customerNumber, contractorNumber })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('3-way call initiated successfully!');
+                    closeModal('threeWayModal');
+                    loadCalls();
+                    loadDashboard();
+                } else {
+                    alert('Error initiating 3-way call: ' + result.error);
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        });
+
+        document.getElementById('addCustomerForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const customerData = {
+                phoneNumber: document.getElementById('newCustomerPhone').value,
+                name: document.getElementById('newCustomerName').value,
+                address: document.getElementById('newCustomerAddress').value,
+                damageType: document.getElementById('newCustomerDamage').value,
+                urgency: document.getElementById('newCustomerUrgency').value,
+                notes: document.getElementById('newCustomerNotes').value
+            };
+            
+            try {
+                const response = await fetch('/api/customers', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(customerData)
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Customer added successfully!');
+                    closeModal('addCustomerModal');
+                    document.getElementById('addCustomerForm').reset();
+                    loadDashboard();
+                } else {
+                    alert('Error adding customer: ' + result.error);
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        });
+
+        document.getElementById('addContractorForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const contractorData = {
+                phoneNumber: document.getElementById('newContractorPhone').value,
+                name: document.getElementById('newContractorName').value,
+                company: document.getElementById('newContractorCompany').value,
+                serviceArea: document.getElementById('newContractorArea').value,
+                specialties: document.getElementById('newContractorSpecialties').value,
+                rating: parseFloat(document.getElementById('newContractorRating').value) || null,
+                availability: document.getElementById('newContractorAvailability').value,
+                notes: document.getElementById('newContractorNotes').value
+            };
+            
+            try {
+                const response = await fetch('/api/contractors', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(contractorData)
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('Contractor added successfully!');
+                    closeModal('addContractorModal');
+                    document.getElementById('addContractorForm').reset();
+                    loadDashboard();
+                } else {
+                    alert('Error adding contractor: ' + result.error);
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        });
+
+        // Close modals when clicking outside
+        window.addEventListener('click', (e) => {
+            if (e.target.classList.contains('modal')) {
+                e.target.style.display = 'none';
+            }
+        });
+
+        // Load data on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            loadDashboard();
+            loadCalls();
+            
+            // Refresh data every 30 seconds
+            setInterval(() => {
+                loadDashboard();
+                loadCalls();
+            }, 30000);
+        });
+    </script>
+</body>
+</html>
