@@ -7,7 +7,6 @@ const { promisify } = require('util');
 
 // Initialize Telnyx with your API key
 const telnyx = require('telnyx')(process.env.TELNYX_API_KEY);
-const telnyxClient = telnyx;  
 
 const app = express();
 app.use(bodyParser.json());
