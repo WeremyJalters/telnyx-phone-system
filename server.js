@@ -1,6 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const telnyx = require('telnyx');
+const { telnyx } = require('telnyx');
 const fs = require('fs').promises;
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
