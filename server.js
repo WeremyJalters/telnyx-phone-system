@@ -116,8 +116,8 @@ app.post('/webhooks/calls', async (req, res) => {
 // Handle incoming calls
 async function handleIncomingCall(data) {
     const callId = data.call_control_id;
-    const fromNumber = data.from;
-    const toNumber = data.to;
+    const fromNumber = data.payload?.from || data.from;
+    const toNumber = data.payload?.to || data.to;
     
     // Store call record
     await dbRun(`
