@@ -81,10 +81,7 @@ const conferenceRooms = new Map();
 app.post('/webhooks/calls', async (req, res) => {
     const { data } = req.body;
     
-    // DEBUG: Log the entire webhook payload
-    console.log('=== FULL WEBHOOK DATA ===');
-    console.log(JSON.stringify(req.body, null, 2));
-    console.log('=== END WEBHOOK DATA ===');
+   
     
     const callId = data.payload?.call_control_id || data.call_control_id;
     
