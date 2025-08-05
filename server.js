@@ -11,11 +11,12 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Force single database instance with absolute path
+// Force single database instance with absolute path and better connection management
 const dbPath = process.env.DATABASE_PATH || join(__dirname, 'call_records.db');
 console.log('Database path:', dbPath);
 
-const db = new sqlite3.Database(dbPath, (err) => {
+// Create database with more explicit settings
+const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
     if (err) {
         console.error('Error opening database:', err);
     } else {
@@ -24,11 +25,15 @@ const db = new sqlite3.Database(dbPath, (err) => {
 });
 
 // Enable WAL mode for better concurrency - but make it synchronous for reliability
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA synchronous = FULL;'); // Changed from NORMAL to FULL for data integrity
-db.exec('PRAGMA cache_size = 1000;');
-db.exec('PRAGMA temp_store = memory;');
-db.exec('PRAGMA busy_timeout = 30000;'); // 30 second timeout for busy database
+db.serialize(() => {
+    db.exec('PRAGMA journal_mode = WAL;');
+    db.exec('PRAGMA synchronous = FULL;'); // Changed from NORMAL to FULL for data integrity
+    db.exec('PRAGMA cache_size = 1000;');
+    db.exec('PRAGMA temp_store = memory;');
+    db.exec('PRAGMA busy_timeout = 30000;'); // 30 second timeout for busy database
+    db.exec('PRAGMA foreign_keys = ON;'); // Enable foreign key constraints
+    console.log('Database PRAGMA settings applied');
+});
 
 // Promisify database methods
 const dbRun = promisify(db.run.bind(db));
@@ -282,6 +287,15 @@ async function handleCallAnswered(data) {
     console.log('Processing call.answered for:', callId);
     
     try {
+        // First verify the record exists before updating
+        const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Found existing call for answered:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
+        
+        if (!existingCall) {
+            console.error('ERROR: Cannot update answered - call record not found for:', callId);
+            return;
+        }
+
         await dbRun('BEGIN IMMEDIATE');
         
         const result = await dbRun(`
@@ -292,11 +306,18 @@ async function handleCallAnswered(data) {
         
         await dbRun('COMMIT');
         
-        console.log('Call status updated to answered for:', callId, 'Rows affected:', result?.changes || 'unknown');
+        console.log('Call status updated to answered for:', callId, 'Rows affected:', result?.changes || 0);
+        
+        if ((result?.changes || 0) === 0) {
+            console.error('WARNING: Answered update affected 0 rows for call:', callId);
+        }
         
         // Verify the update worked
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log('Verified call status after update:', updatedCall?.status);
+        console.log('Verified call status after update:', {
+            found: !!updatedCall,
+            status: updatedCall?.status
+        });
         
     } catch (error) {
         console.error('Error updating call status:', error);
@@ -490,6 +511,15 @@ async function handleCallHangup(data) {
     console.log('Processing call.hangup for:', callId, 'Duration:', duration + 's');
 
     try {
+        // First verify the record exists before updating
+        const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Found existing call for hangup:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
+        
+        if (!existingCall) {
+            console.error('ERROR: Cannot update hangup - call record not found for:', callId);
+            return;
+        }
+
         await dbRun('BEGIN IMMEDIATE');
         
         const result = await dbRun(`
@@ -500,11 +530,16 @@ async function handleCallHangup(data) {
         
         await dbRun('COMMIT');
         
-        console.log('Call hangup processed for:', callId, 'Rows affected:', result?.changes || 'unknown');
+        console.log('Call hangup processed for:', callId, 'Rows affected:', result?.changes || 0);
+        
+        if ((result?.changes || 0) === 0) {
+            console.error('WARNING: Hangup update affected 0 rows for call:', callId);
+        }
         
         // Verify the update worked
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Verified call after hangup:', {
+            found: !!updatedCall,
             status: updatedCall?.status,
             duration: updatedCall?.duration,
             end_time: updatedCall?.end_time
@@ -542,6 +577,15 @@ async function handleRecordingSaved(data) {
     
     // Try to update database with explicit transaction
     try {
+        // First verify the record exists before updating
+        const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Found existing call for recording:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
+        
+        if (!existingCall) {
+            console.error('ERROR: Cannot update recording - call record not found for:', callId);
+            return;
+        }
+
         await dbRun('BEGIN IMMEDIATE');
         
         const result = await dbRun(`
@@ -552,11 +596,18 @@ async function handleRecordingSaved(data) {
         
         await dbRun('COMMIT');
         
-        console.log('Database updated with recording URL, rows affected:', result?.changes || 'unknown');
+        console.log('Database updated with recording URL, rows affected:', result?.changes || 0);
+        
+        if ((result?.changes || 0) === 0) {
+            console.error('WARNING: Recording update affected 0 rows for call:', callId);
+        }
         
         // Verify the update worked
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log('Updated call record - has recording URL:', !!updatedCall?.recording_url);
+        console.log('Updated call record - has recording URL:', {
+            found: !!updatedCall,
+            hasRecording: !!updatedCall?.recording_url
+        });
         
     } catch (error) {
         console.error('Database update failed:', error);
