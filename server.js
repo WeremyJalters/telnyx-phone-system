@@ -119,52 +119,90 @@ async function handleIncomingCall(data) {
     console.log('Handling incoming call:', callId, 'from', fromNumber, 'to', toNumber);
 
     // Store call record
-    await dbRun(`
-        INSERT OR REPLACE INTO calls 
-        (call_id, direction, from_number, to_number, status, start_time, call_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
+    try {
+        await dbRun(`
+            INSERT OR REPLACE INTO calls 
+            (call_id, direction, from_number, to_number, status, start_time, call_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
+    } catch (dbError) {
+        console.error('Database error:', dbError);
+    }
 
     try {
-        // Answer the call
-        await telnyx.calls.answer({
-            call_control_id: callId
+        // Answer the call using direct HTTP API
+        const answerResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({})
         });
-        
+
+        if (!answerResponse.ok) {
+            const errorData = await answerResponse.text();
+            console.error('Failed to answer call:', answerResponse.status, errorData);
+            return;
+        }
+
         console.log('Call answered successfully');
         
-        // Start recording
-        await telnyx.calls.recordStart({
-            call_control_id: callId,
-            format: 'mp3',
-            channels: 'dual'
+        // Start recording using direct HTTP API
+        const recordResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                format: 'mp3',
+                channels: 'dual'
+            })
         });
-        
-        console.log('Recording started');
+
+        if (recordResponse.ok) {
+            console.log('Recording started');
+        } else {
+            console.log('Recording failed, but continuing...');
+        }
         
         // Wait a moment then play greeting and gather input
         setTimeout(async () => {
             try {
-                await telnyx.calls.gatherUsingSpeak({
-                    call_control_id: callId,
-                    payload: "Thank you for calling Weather Pro Solutions, your trusted roofing and exterior specialists. If this is an emergency, press 1. For general inquiries about roofing, siding, or gutters, press 2. To speak with a representative, press 0.",
-                    voice: 'female',
-                    language: 'en-US',
-                    minimum_digits: 1,
-                    maximum_digits: 1,
-                    timeout_millis: 10000,
-                    terminating_digit: '#'
+                const gatherResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/gather_using_speak`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+                    },
+                    body: JSON.stringify({
+                        payload: "Thank you for calling Weather Pro Solutions, your trusted roofing and exterior specialists. If this is an emergency, press 1. For general inquiries about roofing, siding, or gutters, press 2. To speak with a representative, press 0.",
+                        voice: 'female',
+                        language: 'en-US',
+                        minimum_digits: 1,
+                        maximum_digits: 1,
+                        timeout_millis: 10000,
+                        terminating_digit: '#'
+                    })
                 });
                 
-                console.log('IVR menu played successfully');
+                if (gatherResponse.ok) {
+                    console.log('IVR menu played successfully');
+                } else {
+                    const gatherErrorData = await gatherResponse.text();
+                    console.error('Failed to play IVR menu:', gatherResponse.status, gatherErrorData);
+                }
             } catch (error) {
                 console.error('Error playing IVR menu:', error);
             }
-        }, 1000);
+        }, 2000);
         
     } catch (error) {
         console.error('Error in handleIncomingCall:', error);
-        console.error('Error details:', error.raw || error.message);
     }
 }
 
