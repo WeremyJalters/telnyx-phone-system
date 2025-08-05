@@ -134,30 +134,25 @@ async function handleIncomingCall(data) {
         VALUES (?, ?, ?, ?, ?, ?, ?)
     `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
     
-    // Answer the call
-    await telnyx.calls.answer({
-        call_control_id: callId
-    });
-    
-    // Start recording
-    await  telnyx.calls.record_start({
-        call_control_id: callId,
-        format: 'mp3',
-        channels: 'dual'
-    });
-    
-    // Play greeting and gather input
-    await  telnyx.calls.gather_using_speak({
-        call_control_id: callId,
-        payload: "Thank you for calling for flood restoration services. If this is an emergency, press 1. For general inquiries, press 2. To speak with a representative, press 0.",
-        voice: 'female',
-        language: 'en-US',
-        minimum_digits: 1,
-        maximum_digits: 1,
-        timeout_millis: 10000,
-        terminating_digit: '#'
-    });
-}
+    / Answer the call
+await telnyx.calls.answer(callId);
+
+// Start recording
+await telnyx.calls.recordStart(callId, {
+    format: 'mp3',
+    channels: 'dual'
+});
+
+// Play greeting and gather input
+await telnyx.calls.gatherUsingSpeak(callId, {
+    payload: "Thank you for calling for flood restoration services. If this is an emergency, press 1. For general inquiries, press 2. To speak with a representative, press 0.",
+    voice: 'female',
+    language: 'en-US',
+    minimum_digits: 1,
+    maximum_digits: 1,
+    timeout_millis: 10000,
+    terminating_digit: '#'
+});
 
 // Handle call answered
 async function handleCallAnswered(data) {
