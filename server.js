@@ -80,7 +80,7 @@ const conferenceRooms = new Map();
 // Webhook handler for incoming calls
 app.post('/webhooks/calls', async (req, res) => {
     const { data } = req.body;
-    const callId = data.call_control_id;
+    const callId = data.payload?.call_control_id || data.call_control_id;
     
     console.log('Webhook received:', data.event_type, callId);
     
