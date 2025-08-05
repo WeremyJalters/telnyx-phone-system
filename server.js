@@ -505,6 +505,14 @@ app.post('/api/three-way-call', async (req, res) => {
 app.get('/api/calls', async (req, res) => {
     try {
         const { limit = 50, offset = 0, type } = req.query;
+        
+        // First check if database connection is working
+        console.log('API calls endpoint hit - checking database...');
+        
+        // Test database connection
+        const testQuery = await dbGet('SELECT COUNT(*) as count FROM calls');
+        console.log('Database test - total calls:', testQuery);
+        
         let query = 'SELECT * FROM calls';
         let params = [];
 
@@ -516,13 +524,16 @@ app.get('/api/calls', async (req, res) => {
         query += ' ORDER BY start_time DESC LIMIT ? OFFSET ?';
         params.push(parseInt(limit), parseInt(offset));
         
-        console.log('Fetching calls with query:', query, 'params:', params);
+        console.log('Executing query:', query, 'with params:', params);
         const calls = await dbAll(query, params);
-        console.log('Found calls:', calls.length, calls);
+        console.log('Query result - found calls:', calls.length);
+        console.log('Call details:', JSON.stringify(calls, null, 2));
+        
         res.json(calls);
     } catch (error) {
-        console.error('Error fetching calls:', error);
-        res.status(500).json({ error: error.message });
+        console.error('Error in /api/calls endpoint:', error);
+        console.error('Error stack:', error.stack);
+        res.status(500).json({ error: error.message, stack: error.stack });
     }
 });
 
@@ -628,6 +639,38 @@ app.get('/health', (req, res) => {
         port: process.env.PORT || 3000,
         nodeVersion: process.version
     });
+});
+
+// Database debug endpoint
+app.get('/api/debug/db', async (req, res) => {
+    try {
+        console.log('Database debug endpoint called');
+        
+        // Test basic database connection
+        const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
+        console.log('Total calls in DB:', totalCalls);
+        
+        // Get all calls with all columns
+        const allCalls = await dbAll('SELECT * FROM calls ORDER BY id DESC');
+        console.log('All calls in database:', allCalls);
+        
+        // Check table schema
+        const schema = await dbAll("PRAGMA table_info(calls)");
+        console.log('Calls table schema:', schema);
+        
+        res.json({
+            totalCalls: totalCalls.count,
+            calls: allCalls,
+            schema: schema,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('Database debug error:', error);
+        res.status(500).json({ 
+            error: error.message, 
+            stack: error.stack 
+        });
+    }
 });
 
 // Initialize and start server
