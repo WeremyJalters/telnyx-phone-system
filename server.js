@@ -13,8 +13,23 @@ const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Initialize SQLite database
-const db = new sqlite3.Database('call_records.db');
+// Initialize SQLite database with persistent file
+const dbPath = process.env.DATABASE_PATH || './call_records.db';
+console.log('Database path:', dbPath);
+
+const db = new sqlite3.Database(dbPath, (err) => {
+    if (err) {
+        console.error('Error opening database:', err);
+    } else {
+        console.log('Connected to SQLite database at:', dbPath);
+    }
+});
+
+// Enable WAL mode for better concurrency
+db.exec('PRAGMA journal_mode = WAL;');
+db.exec('PRAGMA synchronous = NORMAL;');
+db.exec('PRAGMA cache_size = 1000;');
+db.exec('PRAGMA temp_store = memory;');
 
 // Promisify database methods
 const dbRun = promisify(db.run.bind(db));
@@ -23,53 +38,74 @@ const dbGet = promisify(db.get.bind(db));
 
 // Initialize database tables
 async function initDatabase() {
-    await dbRun(`
-        CREATE TABLE IF NOT EXISTS calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            call_id TEXT UNIQUE,
-            direction TEXT,
-            from_number TEXT,
-            to_number TEXT,
-            status TEXT,
-            start_time DATETIME,
-            end_time DATETIME,
-            duration INTEGER,
-            recording_url TEXT,
-            transcript TEXT,
-            call_type TEXT,
-            customer_info TEXT,
-            contractor_info TEXT,
-            notes TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-    await dbRun(`
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone_number TEXT UNIQUE,
-            name TEXT,
-            address TEXT,
-            damage_type TEXT,
-            urgency TEXT,
-            notes TEXT,
-            status TEXT DEFAULT 'new',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-    await dbRun(`
-        CREATE TABLE IF NOT EXISTS contractors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone_number TEXT UNIQUE,
-            name TEXT,
-            company TEXT,
-            service_area TEXT,
-            specialties TEXT,
-            rating REAL,
-            availability TEXT,
-            notes TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
+    console.log('Initializing database tables...');
+    
+    try {
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id TEXT UNIQUE,
+                direction TEXT,
+                from_number TEXT,
+                to_number TEXT,
+                status TEXT,
+                start_time DATETIME,
+                end_time DATETIME,
+                duration INTEGER,
+                recording_url TEXT,
+                transcript TEXT,
+                call_type TEXT,
+                customer_info TEXT,
+                contractor_info TEXT,
+                notes TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('Calls table initialized');
+        
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS customers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_number TEXT UNIQUE,
+                name TEXT,
+                address TEXT,
+                damage_type TEXT,
+                urgency TEXT,
+                notes TEXT,
+                status TEXT DEFAULT 'new',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('Customers table initialized');
+        
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS contractors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_number TEXT UNIQUE,
+                name TEXT,
+                company TEXT,
+                service_area TEXT,
+                specialties TEXT,
+                rating REAL,
+                availability TEXT,
+                notes TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('Contractors table initialized');
+        
+        // Verify table creation
+        const tables = await dbAll("SELECT name FROM sqlite_master WHERE type='table'");
+        console.log('Database tables created:', tables.map(t => t.name));
+        
+        // Check existing data
+        const existingCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
+        console.log('Existing calls in database:', existingCalls.count);
+        
+    } catch (error) {
+        console.error('Error initializing database:', error);
+        throw error;
+    }
 }
 
 // Call state management
@@ -118,15 +154,25 @@ async function handleIncomingCall(data) {
 
     console.log('Handling incoming call:', callId, 'from', fromNumber, 'to', toNumber);
 
-    // Store call record
+    // Store call record with better error handling
     try {
-        await dbRun(`
+        console.log('Attempting to insert call record into database...');
+        
+        const result = await dbRun(`
             INSERT OR REPLACE INTO calls 
             (call_id, direction, from_number, to_number, status, start_time, call_type)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
+        
+        console.log('Call record inserted successfully. Row ID:', result);
+        
+        // Verify the insert worked
+        const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Verified inserted call:', insertedCall);
+        
     } catch (dbError) {
-        console.error('Database error:', dbError);
+        console.error('Database error inserting call:', dbError);
+        console.error('Database error stack:', dbError.stack);
     }
 
     try {
@@ -917,13 +963,57 @@ app.get('/api/debug/db', async (req, res) => {
 
 // Initialize and start server
 async function startServer() {
-    await initDatabase();
-    const PORT = process.env.PORT || 3000;
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`Telnyx Lead Generation System running on port ${PORT}`);
-        console.log(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhooks/calls`);
-        console.log('Server is ready to receive calls!');
-    });
+    try {
+        console.log('Starting server initialization...');
+        
+        // Initialize database first
+        await initDatabase();
+        
+        const PORT = process.env.PORT || 3000;
+        
+        const server = app.listen(PORT, '0.0.0.0', () => {
+            console.log(`Telnyx Lead Generation System running on port ${PORT}`);
+            console.log(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhooks/calls`);
+            console.log(`Telnyx phone number: ${process.env.TELNYX_PHONE_NUMBER || 'Not set'}`);
+            console.log(`Database path: ${dbPath}`);
+            console.log('Server is ready to receive calls!');
+        });
+
+        // Handle graceful shutdown
+        process.on('SIGTERM', () => {
+            console.log('SIGTERM received, closing database and server...');
+            db.close((err) => {
+                if (err) {
+                    console.error('Error closing database:', err);
+                } else {
+                    console.log('Database connection closed.');
+                }
+                server.close(() => {
+                    console.log('Server closed.');
+                    process.exit(0);
+                });
+            });
+        });
+
+        process.on('SIGINT', () => {
+            console.log('SIGINT received, closing database and server...');
+            db.close((err) => {
+                if (err) {
+                    console.error('Error closing database:', err);
+                } else {
+                    console.log('Database connection closed.');
+                }
+                server.close(() => {
+                    console.log('Server closed.');
+                    process.exit(0);
+                });
+            });
+        });
+        
+    } catch (error) {
+        console.error('Failed to start server:', error);
+        process.exit(1);
+    }
 }
 
 startServer().catch(console.error);
