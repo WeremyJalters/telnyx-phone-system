@@ -1,4 +1,5 @@
 {
+  "type": "module",
   "name": "telnyx-lead-generation",
   "version": "1.0.0",
   "description": "Lead generation phone system using Telnyx",
@@ -10,7 +11,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "body-parser": "^1.20.2",
- "telnyx": "^2.0.1",
+    "telnyx": "^2.0.1",
     "sqlite3": "^5.1.6",
     "dotenv": "^16.3.1",
     "cors": "^2.8.5",
@@ -24,6 +25,6 @@
     "flood-restoration",
     "phone-system"
   ],
-  "author": "Your Name",
+  "author": "JW",
   "license": "MIT"
 }
