@@ -127,19 +127,19 @@ async function handleIncomingCall(data) {
     `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
     
     // Answer the call
-    await telnyxClient.calls.answer({
+    await telnyx.calls.answer({
         call_control_id: callId
     });
     
     // Start recording
-    await telnyxClient.calls.record_start({
+    await  telnyx.calls.record_start({
         call_control_id: callId,
         format: 'mp3',
         channels: 'dual'
     });
     
     // Play greeting and gather input
-    await telnyxClient.calls.gather_using_speak({
+    await  telnyx.calls.gather_using_speak({
         call_control_id: callId,
         payload: "Thank you for calling for flood restoration services. If this is an emergency, press 1. For general inquiries, press 2. To speak with a representative, press 0.",
         voice: 'female',
@@ -178,7 +178,7 @@ async function handleDTMF(data) {
     switch (digit) {
         case '1':
             // Emergency - immediate connection
-            await telnyxClient.calls.speak({
+            await  telnyx.calls.speak({
                 call_control_id: callId,
                 payload: "This is an emergency call. Please hold while we connect you with an available contractor.",
                 voice: 'female',
@@ -196,7 +196,7 @@ async function handleDTMF(data) {
             
         case '0':
             // Speak with representative
-            await telnyxClient.calls.speak({
+            await  telnyx.calls.speak({
                 call_control_id: callId,
                 payload: "Please hold while we connect you with a representative.",
                 voice: 'female',
@@ -210,7 +210,7 @@ async function handleDTMF(data) {
 
 // Collect customer information
 async function collectCustomerInfo(callId) {
-    await telnyxClient.calls.gather_using_speak({
+    await  telnyx.calls.gather_using_speak({
         call_control_id: callId,
         payload: "Please describe your flood damage situation after the beep. Press pound when finished.",
         voice: 'female',
@@ -235,7 +235,7 @@ async function connectToEmergencyContractor(callId) {
         `);
         
         if (!contractor) {
-            await telnyxClient.calls.speak({
+            await  telnyx.calls.speak({
                 call_control_id: callId,
                 payload: "I apologize, but no emergency contractors are currently available. We are connecting you to our on-call service.",
                 voice: 'female',
@@ -253,13 +253,13 @@ async function connectToEmergencyContractor(callId) {
         });
         
         // Add customer to conference
-        await telnyxClient.calls.transfer({
+        await  telnyx.calls.transfer({
             call_control_id: callId,
             to: `conference:${conferenceId}`
         });
         
         // Call contractor
-        const contractorCall = await telnyxClient.calls.create({
+        const contractorCall = await  telnyx.calls.create({
             to: contractor.phone_number,
             from: process.env.TELNYX_PHONE_NUMBER,
             webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
@@ -361,7 +361,7 @@ app.post('/api/call-customer', async (req, res) => {
     try {
         const { customerNumber, message } = req.body;
         
-        const call = await telnyxClient.calls.create({
+        const call = await  telnyx.calls.create({
             to: customerNumber,
             from: process.env.TELNYX_PHONE_NUMBER,
             webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
@@ -394,7 +394,7 @@ app.post('/api/call-contractor', async (req, res) => {
     try {
         const { contractorNumber, jobDetails } = req.body;
         
-        const call = await telnyxClient.calls.create({
+        const call = await  telnyx.calls.create({
             to: contractorNumber,
             from: process.env.TELNYX_PHONE_NUMBER,
             webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
@@ -431,14 +431,14 @@ app.post('/api/three-way-call', async (req, res) => {
         const conferenceId = `conf_${Date.now()}`;
         
         // Call customer
-        const customerCall = await telnyxClient.calls.create({
+        const customerCall = await  telnyx.calls.create({
             to: customerNumber,
             from: process.env.TELNYX_PHONE_NUMBER,
             webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
         });
         
         // Call contractor
-        const contractorCall = await telnyxClient.calls.create({
+        const contractorCall = await  telnyx.calls.create({
             to: contractorNumber,
             from: process.env.TELNYX_PHONE_NUMBER,
             webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
