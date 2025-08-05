@@ -11,6 +11,43 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Database operation queue to ensure single-threaded access
+class DatabaseQueue {
+    constructor() {
+        this.queue = [];
+        this.processing = false;
+    }
+
+    async execute(operation) {
+        return new Promise((resolve, reject) => {
+            this.queue.push({ operation, resolve, reject });
+            this.process();
+        });
+    }
+
+    async process() {
+        if (this.processing || this.queue.length === 0) {
+            return;
+        }
+
+        this.processing = true;
+
+        while (this.queue.length > 0) {
+            const { operation, resolve, reject } = this.queue.shift();
+            try {
+                const result = await operation();
+                resolve(result);
+            } catch (error) {
+                reject(error);
+            }
+        }
+
+        this.processing = false;
+    }
+}
+
+const dbQueue = new DatabaseQueue();
+
 // Force single database instance with absolute path and better connection management
 const dbPath = process.env.DATABASE_PATH || join(__dirname, 'call_records.db');
 console.log('Database path:', dbPath);
@@ -32,13 +69,58 @@ db.serialize(() => {
     db.exec('PRAGMA temp_store = memory;');
     db.exec('PRAGMA busy_timeout = 30000;'); // 30 second timeout for busy database
     db.exec('PRAGMA foreign_keys = ON;'); // Enable foreign key constraints
+    db.exec('PRAGMA locking_mode = EXCLUSIVE;'); // Exclusive locking mode
     console.log('Database PRAGMA settings applied');
 });
 
-// Promisify database methods
-const dbRun = promisify(db.run.bind(db));
-const dbAll = promisify(db.all.bind(db));
-const dbGet = promisify(db.get.bind(db));
+// Promisify database methods with queue
+const dbRun = (sql, params = []) => {
+    return dbQueue.execute(() => {
+        return new Promise((resolve, reject) => {
+            db.run(sql, params, function(err) {
+                if (err) {
+                    console.error('Database RUN error:', err, 'SQL:', sql, 'Params:', params);
+                    reject(err);
+                } else {
+                    console.log('Database RUN success:', sql, 'Changes:', this.changes, 'LastID:', this.lastID);
+                    resolve({ changes: this.changes, lastID: this.lastID });
+                }
+            });
+        });
+    });
+};
+
+const dbAll = (sql, params = []) => {
+    return dbQueue.execute(() => {
+        return new Promise((resolve, reject) => {
+            db.all(sql, params, (err, rows) => {
+                if (err) {
+                    console.error('Database ALL error:', err, 'SQL:', sql, 'Params:', params);
+                    reject(err);
+                } else {
+                    console.log('Database ALL success:', sql, 'Rows:', rows.length);
+                    resolve(rows);
+                }
+            });
+        });
+    });
+};
+
+const dbGet = (sql, params = []) => {
+    return dbQueue.execute(() => {
+        return new Promise((resolve, reject) => {
+            db.get(sql, params, (err, row) => {
+                if (err) {
+                    console.error('Database GET error:', err, 'SQL:', sql, 'Params:', params);
+                    reject(err);
+                } else {
+                    console.log('Database GET success:', sql, 'Found:', !!row);
+                    resolve(row);
+                }
+            });
+        });
+    });
+};
 
 // Middleware
 app.use(express.json());
@@ -171,23 +253,17 @@ async function handleIncomingCall(data) {
     try {
         console.log('Attempting to insert call record into database...');
         
-        // Use BEGIN IMMEDIATE for better concurrency control
-        await dbRun('BEGIN IMMEDIATE');
-        
         const result = await dbRun(`
             INSERT OR REPLACE INTO calls 
             (call_id, direction, from_number, to_number, status, start_time, call_type)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
         
-        // Commit the transaction
-        await dbRun('COMMIT');
-        
         console.log('Call record inserted successfully. Row ID:', result?.lastID);
         
         // Verify the insert worked with a fresh query
         const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = ? ORDER BY id DESC LIMIT 1', [callId]);
-        console.log('Verified inserted call:', insertedCall);
+        console.log('Verified inserted call:', insertedCall ? `ID: ${insertedCall.id}` : 'NOT FOUND');
         
         // Double check total count for debugging
         const totalCount = await dbGet('SELECT COUNT(*) as count FROM calls');
@@ -195,12 +271,6 @@ async function handleIncomingCall(data) {
         
     } catch (dbError) {
         console.error('Database error inserting call:', dbError);
-        // Rollback on error
-        try {
-            await dbRun('ROLLBACK');
-        } catch (rollbackError) {
-            console.error('Error rolling back transaction:', rollbackError);
-        }
     }
 
     try {
@@ -296,15 +366,11 @@ async function handleCallAnswered(data) {
             return;
         }
 
-        await dbRun('BEGIN IMMEDIATE');
-        
         const result = await dbRun(`
             UPDATE calls 
             SET status = 'answered'
             WHERE call_id = ?
         `, [callId]);
-        
-        await dbRun('COMMIT');
         
         console.log('Call status updated to answered for:', callId, 'Rows affected:', result?.changes || 0);
         
@@ -321,11 +387,6 @@ async function handleCallAnswered(data) {
         
     } catch (error) {
         console.error('Error updating call status:', error);
-        try {
-            await dbRun('ROLLBACK');
-        } catch (rollbackError) {
-            console.error('Error rolling back transaction:', rollbackError);
-        }
     }
 
     activeCalls.set(callId, {
@@ -520,15 +581,11 @@ async function handleCallHangup(data) {
             return;
         }
 
-        await dbRun('BEGIN IMMEDIATE');
-        
         const result = await dbRun(`
             UPDATE calls 
             SET status = 'completed', end_time = ?, duration = ?
             WHERE call_id = ?
         `, [endTime, duration, callId]);
-        
-        await dbRun('COMMIT');
         
         console.log('Call hangup processed for:', callId, 'Rows affected:', result?.changes || 0);
         
@@ -547,11 +604,6 @@ async function handleCallHangup(data) {
         
     } catch (error) {
         console.error('Error updating call hangup:', error);
-        try {
-            await dbRun('ROLLBACK');
-        } catch (rollbackError) {
-            console.error('Error rolling back transaction:', rollbackError);
-        }
     }
 
     activeCalls.delete(callId);
