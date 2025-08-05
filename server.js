@@ -1,13 +1,13 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const telnyx = require('telnyx');
+const telnyx = require('telnyx')(process.env.TELNYX_API_KEY);
 const fs = require('fs').promises;
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 const { promisify } = require('util');
 
 // Initialize Telnyx with your API key
-const telnyxClient = telnyx(process.env.TELNYX_API_KEY);
+const telnyxClient = telnyx;
 
 const app = express();
 app.use(bodyParser.json());
