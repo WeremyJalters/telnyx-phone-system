@@ -1,354 +1,575 @@
 import express from 'express';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import bodyParser from 'body-parser';
+import { promises as fs } from 'fs';
+import path from 'path';
+import sqlite3 from 'sqlite3';
+import { promisify } from 'util';
 import Telnyx from 'telnyx';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Initialize Telnyx
+// Initialize Telnyx with your API key
 const telnyx = new Telnyx(process.env.TELNYX_API_KEY);
 
-// Middleware
-app.use(express.json());
-app.use(express.static(join(__dirname, 'public')));
+const app = express();
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
-// In-memory storage for demo (use a database in production)
-let callHistory = [];
-let callStats = {
-    total: 0,
-    answered: 0,
-    missed: 0,
-    leads: 0
-};
+// Initialize SQLite database
+const db = new sqlite3.Database('call_records.db');
 
-// Routes
-app.get('/', (req, res) => {
-    res.sendFile(join(__dirname, 'public', 'index.html'));
-});
+// Promisify database methods
+const dbRun = promisify(db.run.bind(db));
+const dbAll = promisify(db.all.bind(db));
+const dbGet = promisify(db.get.bind(db));
 
-app.get('/api/stats', (req, res) => {
-    res.json(callStats);
-});
+// Initialize database tables
+async function initDatabase() {
+    await dbRun(`
+        CREATE TABLE IF NOT EXISTS calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            call_id TEXT UNIQUE,
+            direction TEXT,
+            from_number TEXT,
+            to_number TEXT,
+            status TEXT,
+            start_time DATETIME,
+            end_time DATETIME,
+            duration INTEGER,
+            recording_url TEXT,
+            transcript TEXT,
+            call_type TEXT,
+            customer_info TEXT,
+            contractor_info TEXT,
+            notes TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+    await dbRun(`
+        CREATE TABLE IF NOT EXISTS customers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone_number TEXT UNIQUE,
+            name TEXT,
+            address TEXT,
+            damage_type TEXT,
+            urgency TEXT,
+            notes TEXT,
+            status TEXT DEFAULT 'new',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+    await dbRun(`
+        CREATE TABLE IF NOT EXISTS contractors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone_number TEXT UNIQUE,
+            name TEXT,
+            company TEXT,
+            service_area TEXT,
+            specialties TEXT,
+            rating REAL,
+            availability TEXT,
+            notes TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+}
 
-app.get('/api/calls', (req, res) => {
-    res.json(callHistory.slice(-50)); // Return last 50 calls
-});
+// Call state management
+const activeCalls = new Map();
+const conferenceRooms = new Map();
 
-// Webhook endpoint for Telnyx
-app.post('/webhook', async (req, res) => {
-    console.log('Webhook received:', JSON.stringify(req.body, null, 2));
-    
-    const { event_type, payload } = req.body.data;
-    
+// Webhook handler for incoming calls
+app.post('/webhooks/calls', async (req, res) => {
+    const { data } = req.body;
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    console.log('Webhook received:', data.event_type, callId);
+
     try {
-        switch (event_type) {
+        switch (data.event_type) {
             case 'call.initiated':
-                await handleCallInitiated(payload);
+                await handleIncomingCall(data);
                 break;
             case 'call.answered':
-                await handleCallAnswered(payload);
+                await handleCallAnswered(data);
                 break;
             case 'call.hangup':
-                await handleCallHangup(payload);
-                break;
-            case 'call.gather.ended':
-                await handleGatherEnded(payload);
+                await handleCallHangup(data);
                 break;
             case 'call.recording.saved':
-                await handleRecordingSaved(payload);
+                await handleRecordingSaved(data);
                 break;
-            case 'call.transcription.received':
-                await handleTranscriptionReceived(payload);
+            case 'call.dtmf.received':
+                await handleDTMF(data);
                 break;
-            default:
-                console.log(`Unhandled event type: ${event_type}`);
         }
     } catch (error) {
-        console.error('Error handling webhook:', error);
+        console.error('Webhook error:', error);
     }
-    
-    res.sendStatus(200);
+
+    res.status(200).send('OK');
 });
 
-async function handleCallInitiated(payload) {
-    console.log('Call initiated:', payload.call_control_id);
-    
-    const callData = {
-        id: payload.call_control_id,
-        from: payload.from,
-        to: payload.to,
-        status: 'initiated',
-        timestamp: new Date().toISOString(),
-        duration: 0
-    };
-    
-    callHistory.unshift(callData);
-    callStats.total++;
-    
-    try {
-        // Answer the call
-        console.log('Attempting to answer call:', payload.call_control_id);
-        await telnyx.calls.answer({
-            call_control_id: payload.call_control_id
-        });
+// Handle incoming calls
+async function handleIncomingCall(data) {
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    const fromNumber = data.payload?.from || data.from;
+    const toNumber = data.payload?.to || data.to;
+
+    console.log('Handling incoming call:', callId, 'from', fromNumber, 'to', toNumber);
+
+    // Store call record
+    await dbRun(`
+        INSERT OR REPLACE INTO calls 
+        (call_id, direction, from_number, to_number, status, start_time, call_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
+
+    // Answer the call
+    await telnyx.calls.answer({
+        call_control_id: callId
+    });
         
-        console.log('Call answered successfully');
+    // Start recording
+    await telnyx.calls.record_start({
+        call_control_id: callId,
+        format: 'mp3',
+        channels: 'dual'
+    });
         
-        // Start recording
-        await telnyx.calls.recordStart({
-            call_control_id: payload.call_control_id,
-            format: 'mp3',
-            channels: 'dual'
-        });
-        
-        console.log('Recording started');
-        
-        // Wait a moment then play IVR menu
-        setTimeout(async () => {
-            try {
-                await playIVRMenu(payload.call_control_id);
-            } catch (error) {
-                console.error('Error playing IVR menu:', error);
-            }
-        }, 1000);
-        
-    } catch (error) {
-        console.error('Error answering call:', error);
-        console.error('Error details:', error.response?.data || error.message);
-    }
+    // Play greeting and gather input
+    await telnyx.calls.gather_using_speak({
+        call_control_id: callId,
+        payload: "Thank you for calling Weather Pro Solutions, your trusted roofing and exterior specialists. If this is an emergency, press 1. For general inquiries about roofing, siding, or gutters, press 2. To speak with a representative, press 0.",
+        voice: 'female',
+        language: 'en-US',
+        minimum_digits: 1,
+        maximum_digits: 1,
+        timeout_millis: 10000,
+        terminating_digit: '#'
+    });
 }
 
-async function handleCallAnswered(payload) {
-    console.log('Call answered event received:', payload.call_control_id);
-    
-    // Update call history
-    const call = callHistory.find(c => c.id === payload.call_control_id);
-    if (call) {
-        call.status = 'answered';
-        call.answeredAt = new Date().toISOString();
-    }
-    
-    callStats.answered++;
+// Handle call answered
+async function handleCallAnswered(data) {
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    await dbRun(`
+        UPDATE calls 
+        SET status = 'answered'
+        WHERE call_id = ?
+    `, [callId]);
+
+    activeCalls.set(callId, {
+        status: 'active',
+        startTime: new Date(),
+        participants: 1
+    });
 }
 
-async function handleCallHangup(payload) {
-    console.log('Call hangup:', payload.call_control_id);
+// Handle DTMF (keypad) input
+async function handleDTMF(data) {
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    const digit = data.payload?.digit || data.digit;
     
-    // Update call history
-    const call = callHistory.find(c => c.id === payload.call_control_id);
-    if (call) {
-        call.status = 'completed';
-        call.hangupCause = payload.hangup_cause;
-        call.duration = payload.call_duration || 0;
-        call.endedAt = new Date().toISOString();
-    }
-    
-    // Stop recording if it's still active
-    try {
-        await telnyx.calls.recordStop({
-            call_control_id: payload.call_control_id
-        });
-    } catch (error) {
-        console.log('Recording already stopped or call ended');
-    }
-}
+    console.log(`DTMF received: ${digit} for call ${callId}`);
 
-async function playIVRMenu(callId) {
-    console.log('Playing IVR menu for call:', callId);
-    
-    const menuText = `Hello! Thank you for calling Weather Pro Solutions, your trusted roofing and exterior specialists. 
-    
-    We're here to help with all your roofing needs, from repairs to full replacements, siding, gutters, and storm damage restoration.
-    
-    Please press 1 to speak with a roofing specialist about a free estimate.
-    Press 2 for emergency roof repairs.
-    Press 3 to check on an existing project.
-    Or stay on the line to leave a detailed message about your roofing needs.`;
-    
-    try {
-        await telnyx.calls.gatherUsingSpeak({
-            call_control_id: callId,
-            payload: menuText,
-            voice: 'female',
-            language: 'en-US',
-            minimum_digits: 1,
-            maximum_digits: 1,
-            timeout_millis: 10000,
-            invalid_audio_url: null
-        });
-        
-        console.log('IVR menu sent successfully');
-        
-    } catch (error) {
-        console.error('Error playing IVR menu:', error);
-        
-        // Fallback: just speak the message without gathering input
-        try {
+    switch (digit) {
+        case '1':
+            // Emergency - immediate connection
             await telnyx.calls.speak({
                 call_control_id: callId,
-                payload: "Hello! Thank you for calling Weather Pro Solutions. Please hold while we connect you to a specialist, or leave a message after the tone.",
+                payload: "This is an emergency roofing call. Please hold while we connect you with an available contractor for immediate assistance.",
                 voice: 'female',
                 language: 'en-US'
             });
-        } catch (fallbackError) {
-            console.error('Fallback speak also failed:', fallbackError);
-        }
-    }
-}
-
-async function handleGatherEnded(payload) {
-    console.log('Gather ended:', payload);
-    const callId = payload.call_control_id;
-    const digits = payload.digits;
-    
-    try {
-        switch (digits) {
-            case '1':
-                await telnyx.calls.speak({
-                    call_control_id: callId,
-                    payload: "Thank you for your interest in our roofing services! You'll be connected to a specialist shortly. Please stay on the line to leave details about your project, including your address and the type of service you need.",
-                    voice: 'female',
-                    language: 'en-US'
-                });
-                
-                // Mark as a qualified lead
-                callStats.leads++;
-                const call = callHistory.find(c => c.id === callId);
-                if (call) {
-                    call.leadType = 'roofing_estimate';
-                    call.isLead = true;
-                }
-                break;
-                
-            case '2':
-                await telnyx.calls.speak({
-                    call_control_id: callId,
-                    payload: "This is our emergency repair line. Please stay on the line and provide details about your roofing emergency, including your location and the nature of the damage. We'll prioritize your call.",
-                    voice: 'female',
-                    language: 'en-US'
-                });
-                
-                callStats.leads++;
-                const emergencyCall = callHistory.find(c => c.id === callId);
-                if (emergencyCall) {
-                    emergencyCall.leadType = 'emergency_repair';
-                    emergencyCall.isLead = true;
-                }
-                break;
-                
-            case '3':
-                await telnyx.calls.speak({
-                    call_control_id: callId,
-                    payload: "Thank you for checking on your project. Please leave your name, project address, and any questions you have. We'll get back to you with an update within 24 hours.",
-                    voice: 'female',
-                    language: 'en-US'
-                });
-                break;
-                
-            default:
-                await telnyx.calls.speak({
-                    call_control_id: callId,
-                    payload: "Thank you for calling Weather Pro Solutions. Please leave a detailed message including your name, phone number, address, and the roofing services you're interested in. We'll call you back within 24 hours.",
-                    voice: 'female',
-                    language: 'en-US'
-                });
-        }
-        
-        // Start voicemail recording after the message
-        setTimeout(async () => {
-            try {
-                await startVoicemailRecording(callId);
-            } catch (error) {
-                console.error('Error starting voicemail recording:', error);
-            }
-        }, 5000);
-        
-    } catch (error) {
-        console.error('Error handling menu selection:', error);
-    }
-}
-
-async function startVoicemailRecording(callId) {
-    try {
-        // Play a beep tone
-        await telnyx.calls.playAudio({
-            call_control_id: callId,
-            audio_url: 'https://www.soundjay.com/misc/sounds/beep-28.wav'
-        });
-        
-        // The call is already being recorded, so we just need to let them talk
-        console.log('Voicemail recording active for call:', callId);
-        
-    } catch (error) {
-        console.error('Error starting voicemail:', error);
-    }
-}
-
-async function handleRecordingSaved(payload) {
-    console.log('Recording saved:', payload);
-    
-    const call = callHistory.find(c => c.id === payload.call_control_id);
-    if (call) {
-        call.recordingUrl = payload.recording_urls?.mp3;
-        call.recordingId = payload.recording_id;
-    }
-    
-    // Request transcription if available
-    if (payload.recording_id) {
-        try {
-            await telnyx.recordings.transcribe({
-                recording_id: payload.recording_id
+            // Find and call emergency contractor
+            await connectToEmergencyContractor(callId);
+            break;
+        case '2':
+            // General inquiry - collect information
+            await collectCustomerInfo(callId);
+            break;
+        case '0':
+            // Speak with representative
+            await telnyx.calls.speak({
+                call_control_id: callId,
+                payload: "Please hold while we connect you with a Weather Pro Solutions representative.",
+                voice: 'female',
+                language: 'en-US'
             });
-        } catch (error) {
-            console.error('Error requesting transcription:', error);
+            // You would implement your logic to connect to your team
+            break;
+    }
+}
+
+// Collect customer information
+async function collectCustomerInfo(callId) {
+    await telnyx.calls.gather_using_speak({
+        call_control_id: callId,
+        payload: "Please describe your roofing project or issue after the beep. Include your address and type of service needed. Press pound when finished.",
+        voice: 'female',
+        language: 'en-US',
+        minimum_digits: 0,
+        maximum_digits: 0,
+        timeout_millis: 30000,
+        terminating_digit: '#'
+    });
+}
+
+// Connect to emergency contractor
+async function connectToEmergencyContractor(callId) {
+    try {
+        // Get available emergency contractor
+        const contractor = await dbGet(`
+            SELECT * FROM contractors 
+            WHERE availability = 'available'
+            AND specialties LIKE '%emergency%'
+            ORDER BY rating DESC 
+            LIMIT 1
+        `);
+
+        if (!contractor) {
+            await telnyx.calls.speak({
+                call_control_id: callId,
+                payload: "I apologize, but no emergency contractors are currently available. We are connecting you to our on-call service.",
+                voice: 'female',
+                language: 'en-US'
+            });
+            return;
+        }
+
+        // Create conference room
+        const conferenceId = `conf_${Date.now()}`;
+        conferenceRooms.set(conferenceId, {
+            customer: callId,
+            contractor: null,
+            created: new Date()
+        });
+
+        // Add customer to conference
+        await telnyx.calls.transfer({
+            call_control_id: callId,
+            to: `conference:${conferenceId}`
+        });
+
+        // Call contractor
+        const contractorCall = await telnyx.calls.create({
+            to: contractor.phone_number,
+            from: process.env.TELNYX_PHONE_NUMBER,
+            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        });
+
+        // Store contractor call info
+        await dbRun(`
+            INSERT INTO calls 
+            (call_id, direction, from_number, to_number, status, start_time, call_type, contractor_info)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, 
+        [
+            contractorCall.data.call_control_id,
+            'outbound',
+            process.env.TELNYX_PHONE_NUMBER,
+            contractor.phone_number,
+            'initiated',
+            new Date().toISOString(),
+            'contractor_connect',
+            JSON.stringify(contractor)
+        ]);
+
+        conferenceRooms.get(conferenceId).contractor = contractorCall.data.call_control_id;
+
+    } catch (error) {
+        console.error('Error connecting to contractor:', error);
+    }
+}
+
+// Handle call hangup
+async function handleCallHangup(data) {
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    const endTime = new Date().toISOString();
+    const callInfo = activeCalls.get(callId);
+    const duration = callInfo ? Math.floor((new Date() - callInfo.startTime) / 1000) : 0;
+
+    await dbRun(`
+        UPDATE calls 
+        SET status = 'completed', end_time = ?, duration = ?
+        WHERE call_id = ?
+    `, [endTime, duration, callId]);
+
+    activeCalls.delete(callId);
+
+    // Clean up any conference rooms
+    for (const [confId, conf] of conferenceRooms) {
+        if (conf.customer === callId || conf.contractor === callId) {
+            conferenceRooms.delete(confId);
+            break;
         }
     }
 }
 
-async function handleTranscriptionReceived(payload) {
-    console.log('Transcription received:', payload);
+// Handle recording saved
+async function handleRecordingSaved(data) {
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    const recordingUrl = data.payload?.recording_url || data.recording_url;
     
-    const call = callHistory.find(c => c.recordingId === payload.recording_id);
-    if (call) {
-        call.transcription = payload.transcription_text;
+    await dbRun(`
+        UPDATE calls 
+        SET recording_url = ?
+        WHERE call_id = ?
+    `, [recordingUrl, callId]);
+
+    // Generate transcript
+    await generateTranscript(callId, recordingUrl);
+}
+
+// Generate transcript using speech-to-text service
+async function generateTranscript(callId, recordingUrl) {
+    try {
+        // You'll need to integrate with a speech-to-text service like:
+        // - Google Cloud Speech-to-Text
+        // - AWS Transcribe
+        // - Azure Speech Services
+        // - AssemblyAI
         
-        // Analyze transcription for lead quality
-        const text = payload.transcription_text.toLowerCase();
-        if (text.includes('roof') || text.includes('leak') || text.includes('repair') || 
-            text.includes('estimate') || text.includes('damage') || text.includes('replace')) {
-            call.leadQuality = 'high';
-            if (!call.isLead) {
-                call.isLead = true;
-                callStats.leads++;
-            }
-        }
+        console.log(`Transcript generation requested for call ${callId}`);
+    } catch (error) {
+        console.error('Transcript generation error:', error);
     }
 }
+
+// API Routes
+// Make outbound call to customer
+app.post('/api/call-customer', async (req, res) => {
+    try {
+        const { customerNumber, message } = req.body;
+        const call = await telnyx.calls.create({
+            to: customerNumber,
+            from: process.env.TELNYX_PHONE_NUMBER,
+            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        });
+
+        // Store call record
+        await dbRun(`
+            INSERT INTO calls 
+            (call_id, direction, from_number, to_number, status, start_time, call_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, 
+        [
+            call.data.call_control_id,
+            'outbound',
+            process.env.TELNYX_PHONE_NUMBER,
+            customerNumber,
+            'initiated',
+            new Date().toISOString(),
+            'customer_followup'
+        ]);
+
+        res.json({ success: true, callId: call.data.call_control_id });
+    } catch (error) {
+        console.error('Error making customer call:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Make outbound call to contractor
+app.post('/api/call-contractor', async (req, res) => {
+    try {
+        const { contractorNumber, jobDetails } = req.body;
+        const call = await telnyx.calls.create({
+            to: contractorNumber,
+            from: process.env.TELNYX_PHONE_NUMBER,
+            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        });
+
+        await dbRun(`
+            INSERT INTO calls 
+            (call_id, direction, from_number, to_number, status, start_time, call_type, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, 
+        [
+            call.data.call_control_id,
+            'outbound',
+            process.env.TELNYX_PHONE_NUMBER,
+            contractorNumber,
+            'initiated',
+            new Date().toISOString(),
+            'contractor_outreach',
+            JSON.stringify(jobDetails)
+        ]);
+
+        res.json({ success: true, callId: call.data.call_control_id });
+    } catch (error) {
+        console.error('Error making contractor call:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Create three-way call
+app.post('/api/three-way-call', async (req, res) => {
+    try {
+        const { customerNumber, contractorNumber } = req.body;
+        
+        // Create conference room
+        const conferenceId = `conf_${Date.now()}`;
+
+        // Call customer
+        const customerCall = await telnyx.calls.create({
+            to: customerNumber,
+            from: process.env.TELNYX_PHONE_NUMBER,
+            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        });
+
+        // Call contractor
+        const contractorCall = await telnyx.calls.create({
+            to: contractorNumber,
+            from: process.env.TELNYX_PHONE_NUMBER,
+            webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+        });
+
+        // Store conference info
+        conferenceRooms.set(conferenceId, {
+            customer: customerCall.data.call_control_id,
+            contractor: contractorCall.data.call_control_id,
+            created: new Date()
+        });
+
+        res.json({ 
+            success: true,
+            conferenceId,
+            customerCallId: customerCall.data.call_control_id,
+            contractorCallId: contractorCall.data.call_control_id
+        });
+    } catch (error) {
+        console.error('Error creating three-way call:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get call records
+app.get('/api/calls', async (req, res) => {
+    try {
+        const { limit = 50, offset = 0, type } = req.query;
+        let query = 'SELECT * FROM calls';
+        let params = [];
+
+        if (type) {
+            query += ' WHERE call_type = ?';
+            params.push(type);
+        }
+
+        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+        params.push(parseInt(limit), parseInt(offset));
+        
+        const calls = await dbAll(query, params);
+        res.json(calls);
+    } catch (error) {
+        console.error('Error fetching calls:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get call details
+app.get('/api/calls/:callId', async (req, res) => {
+    try {
+        const { callId } = req.params;
+        const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        
+        if (!call) {
+            return res.status(404).json({ error: 'Call not found' });
+        }
+        
+        res.json(call);
+    } catch (error) {
+        console.error('Error fetching call details:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Add customer
+app.post('/api/customers', async (req, res) => {
+    try {
+        const { phoneNumber, name, address, damageType, urgency, notes } = req.body;
+        
+        await dbRun(`
+            INSERT OR REPLACE INTO customers 
+            (phone_number, name, address, damage_type, urgency, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `, [phoneNumber, name, address, damageType, urgency, notes]);
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error adding customer:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Add contractor
+app.post('/api/contractors', async (req, res) => {
+    try {
+        const { phoneNumber, name, company, serviceArea, specialties, rating, availability, notes } = req.body;
+        
+        await dbRun(`
+            INSERT OR REPLACE INTO contractors 
+            (phone_number, name, company, service_area, specialties, rating, availability, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, [phoneNumber, name, company, serviceArea, specialties, rating, availability, notes]);
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error adding contractor:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Dashboard endpoint
+app.get('/api/dashboard', async (req, res) => {
+    try {
+        const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
+        const todayCalls = await dbGet(`
+            SELECT COUNT(*) as count FROM calls 
+            WHERE DATE(created_at) = DATE('now')
+        `);
+        const activeCalls = await dbGet(`
+            SELECT COUNT(*) as count FROM calls 
+            WHERE status = 'answered'
+        `);
+        const totalCustomers = await dbGet('SELECT COUNT(*) as count FROM customers');
+        const totalContractors = await dbGet('SELECT COUNT(*) as count FROM contractors');
+
+        res.json({
+            totalCalls: totalCalls.count,
+            todayCalls: todayCalls.count,
+            activeCalls: activeCalls.count,
+            totalCustomers: totalCustomers.count,  
+            totalContractors: totalContractors.count
+        });
+    } catch (error) {
+        console.error('Error fetching dashboard data:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Serve static files for dashboard
+app.use(express.static('public'));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'healthy', 
         timestamp: new Date().toISOString(),
-        port: PORT,
+        port: process.env.PORT || 3000,
         nodeVersion: process.version
     });
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-    console.error('Express error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-});
+// Initialize and start server
+async function startServer() {
+    await initDatabase();
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Telnyx Lead Generation System running on port ${PORT}`);
+        console.log(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhooks/calls`);
+        console.log('Server is ready to receive calls!');
+    });
+}
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Webhook URL: ${process.env.WEBHOOK_URL || 'Not set'}`);
-    console.log(`Telnyx phone number: ${process.env.TELNYX_PHONE_NUMBER || 'Not set'}`);
-    console.log('Server is ready to receive calls!');
-});
+startServer().catch(console.error);
+
+export default app;
