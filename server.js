@@ -366,13 +366,29 @@ async function handleCallHangup(data) {
 // Handle recording saved
 async function handleRecordingSaved(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
-    const recordingUrl = data.payload?.recording_url || data.recording_url;
+    const recordingUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
+    const recordingId = data.payload?.recording_id || data.recording_id;
     
-    await dbRun(`
-        UPDATE calls 
-        SET recording_url = ?
-        WHERE call_id = ?
-    `, [recordingUrl, callId]);
+    console.log('Recording saved for call:', callId);
+    console.log('Recording URL:', recordingUrl);
+    console.log('Recording ID:', recordingId);
+    
+    try {
+        await dbRun(`
+            UPDATE calls 
+            SET recording_url = ?
+            WHERE call_id = ?
+        `, [recordingUrl, callId]);
+        
+        console.log('Database updated with recording URL');
+        
+        // Verify the update worked
+        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Updated call record:', updatedCall);
+        
+    } catch (error) {
+        console.error('Error updating call with recording URL:', error);
+    }
 
     // Generate transcript
     await generateTranscript(callId, recordingUrl);
@@ -630,6 +646,232 @@ app.get('/api/dashboard', async (req, res) => {
 
 // Serve static files for dashboard
 app.use(express.static('public'));
+
+// Calls viewer page
+app.get('/calls', (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Weather Pro Solutions - Call Records</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        .calls-container {
+            background: white;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .call-record {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            background: #fafafa;
+        }
+        .call-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .call-numbers {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+        }
+        .call-status {
+            padding: 6px 12px;
+            border-radius: 20px;
+            color: white;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+        .status-answered { background-color: #4CAF50; }
+        .status-completed { background-color: #2196F3; }
+        .status-initiated { background-color: #FF9800; }
+        .call-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        .detail-item {
+            display: flex;
+            flex-direction: column;
+        }
+        .detail-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+        .detail-value {
+            font-weight: bold;
+            color: #333;
+        }
+        .recording-button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 14px;
+        }
+        .recording-button:hover {
+            background: #45a049;
+        }
+        .recording-button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .no-calls {
+            text-align: center;
+            color: #666;
+            font-style: italic;
+            padding: 40px;
+        }
+        .refresh-button {
+            background: #2196F3;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-bottom: 20px;
+        }
+        .refresh-button:hover {
+            background: #1976D2;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📞 Weather Pro Solutions</h1>
+        <p>Call Records & Recordings</p>
+    </div>
+
+    <div class="calls-container">
+        <button class="refresh-button" onclick="loadCalls()">🔄 Refresh Calls</button>
+        
+        <div id="calls-list" class="loading">
+            Loading call records...
+        </div>
+    </div>
+
+    <script>
+        async function loadCalls() {
+            const callsList = document.getElementById('calls-list');
+            callsList.innerHTML = '<div class="loading">Loading call records...</div>';
+            
+            try {
+                const response = await fetch('/api/calls');
+                const calls = await response.json();
+                
+                if (calls.length === 0) {
+                    callsList.innerHTML = '<div class="no-calls">No call records found</div>';
+                    return;
+                }
+                
+                let html = '';
+                calls.forEach(call => {
+                    const startTime = new Date(call.start_time).toLocaleString();
+                    const duration = call.duration ? call.duration + 's' : 'N/A';
+                    const endTime = call.end_time ? new Date(call.end_time).toLocaleString() : 'N/A';
+                    
+                    html += \`
+                        <div class="call-record">
+                            <div class="call-header">
+                                <div class="call-numbers">
+                                    \${call.from_number} → \${call.to_number}
+                                </div>
+                                <div class="call-status status-\${call.status}">
+                                    \${call.status}
+                                </div>
+                            </div>
+                            
+                            <div class="call-details">
+                                <div class="detail-item">
+                                    <div class="detail-label">Call Type</div>
+                                    <div class="detail-value">\${call.call_type || 'N/A'}</div>
+                                </div>
+                                <div class="detail-item">
+                                    <div class="detail-label">Start Time</div>
+                                    <div class="detail-value">\${startTime}</div>
+                                </div>
+                                <div class="detail-item">
+                                    <div class="detail-label">Duration</div>
+                                    <div class="detail-value">\${duration}</div>
+                                </div>
+                                <div class="detail-item">
+                                    <div class="detail-label">End Time</div>
+                                    <div class="detail-value">\${endTime}</div>
+                                </div>
+                                <div class="detail-item">
+                                    <div class="detail-label">Recording</div>
+                                    <div class="detail-value">
+                                        \${call.recording_url ? 
+                                            \`<a href="\${call.recording_url}" target="_blank" class="recording-button">🎵 Play Recording</a>\` :
+                                            '<button class="recording-button" disabled>No Recording</button>'
+                                        }
+                                    </div>
+                                </div>
+                                <div class="detail-item">
+                                    <div class="detail-label">Call ID</div>
+                                    <div class="detail-value" style="font-size: 10px; font-family: monospace;">\${call.call_id}</div>
+                                </div>
+                            </div>
+                            
+                            \${call.transcript ? \`
+                                <div style="margin-top: 15px; padding: 10px; background: #e8f5e8; border-radius: 5px;">
+                                    <div class="detail-label">Transcript</div>
+                                    <div class="detail-value">\${call.transcript}</div>
+                                </div>
+                            \` : ''}
+                        </div>
+                    \`;
+                });
+                
+                callsList.innerHTML = html;
+                
+            } catch (error) {
+                console.error('Error loading calls:', error);
+                callsList.innerHTML = \`<div class="no-calls">Error loading calls: \${error.message}</div>\`;
+            }
+        }
+        
+        // Load calls when page loads
+        loadCalls();
+        
+        // Auto-refresh every 30 seconds
+        setInterval(loadCalls, 30000);
+    </script>
+</body>
+</html>`);
+});
 
 // Health check endpoint
 app.get('/health', (req, res) => {
