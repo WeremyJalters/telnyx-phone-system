@@ -10,7 +10,7 @@ import Telnyx from 'telnyx';
 
 
 // Initialize Telnyx with your API key
-import Telnyx from 'telnyx';
+
 const telnyx = new Telnyx(process.env.TELNYX_API_KEY);
 
 const app = express();
