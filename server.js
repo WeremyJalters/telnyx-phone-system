@@ -513,10 +513,12 @@ app.get('/api/calls', async (req, res) => {
             params.push(type);
         }
 
-        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+        query += ' ORDER BY start_time DESC LIMIT ? OFFSET ?';
         params.push(parseInt(limit), parseInt(offset));
         
+        console.log('Fetching calls with query:', query, 'params:', params);
         const calls = await dbAll(query, params);
+        console.log('Found calls:', calls.length, calls);
         res.json(calls);
     } catch (error) {
         console.error('Error fetching calls:', error);
@@ -581,16 +583,26 @@ app.post('/api/contractors', async (req, res) => {
 app.get('/api/dashboard', async (req, res) => {
     try {
         const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
+        console.log('Total calls in DB:', totalCalls);
+        
         const todayCalls = await dbGet(`
             SELECT COUNT(*) as count FROM calls 
-            WHERE DATE(created_at) = DATE('now')
+            WHERE DATE(start_time) = DATE('now')
         `);
+        console.log('Today calls:', todayCalls);
+        
         const activeCalls = await dbGet(`
             SELECT COUNT(*) as count FROM calls 
-            WHERE status = 'answered'
+            WHERE status = 'answered' OR status = 'initiated'
         `);
+        console.log('Active calls:', activeCalls);
+        
         const totalCustomers = await dbGet('SELECT COUNT(*) as count FROM customers');
         const totalContractors = await dbGet('SELECT COUNT(*) as count FROM contractors');
+
+        // Also get recent calls for debugging
+        const recentCalls = await dbAll('SELECT * FROM calls ORDER BY start_time DESC LIMIT 10');
+        console.log('Recent calls for dashboard:', recentCalls);
 
         res.json({
             totalCalls: totalCalls.count,
