@@ -279,16 +279,25 @@ async function handleIncomingCall(data) {
 async function handleCallAnswered(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
     
+    console.log('Processing call.answered for:', callId);
+    
     try {
         await dbRun('BEGIN IMMEDIATE');
-        await dbRun(`
+        
+        const result = await dbRun(`
             UPDATE calls 
             SET status = 'answered'
             WHERE call_id = ?
         `, [callId]);
+        
         await dbRun('COMMIT');
         
-        console.log('Call status updated to answered for:', callId);
+        console.log('Call status updated to answered for:', callId, 'Rows affected:', result?.changes || 'unknown');
+        
+        // Verify the update worked
+        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Verified call status after update:', updatedCall?.status);
+        
     } catch (error) {
         console.error('Error updating call status:', error);
         try {
@@ -478,16 +487,29 @@ async function handleCallHangup(data) {
     const callInfo = activeCalls.get(callId);
     const duration = callInfo ? Math.floor((new Date() - callInfo.startTime) / 1000) : 0;
 
+    console.log('Processing call.hangup for:', callId, 'Duration:', duration + 's');
+
     try {
         await dbRun('BEGIN IMMEDIATE');
-        await dbRun(`
+        
+        const result = await dbRun(`
             UPDATE calls 
             SET status = 'completed', end_time = ?, duration = ?
             WHERE call_id = ?
         `, [endTime, duration, callId]);
+        
         await dbRun('COMMIT');
         
-        console.log('Call hangup processed for:', callId, 'Duration:', duration + 's');
+        console.log('Call hangup processed for:', callId, 'Rows affected:', result?.changes || 'unknown');
+        
+        // Verify the update worked
+        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Verified call after hangup:', {
+            status: updatedCall?.status,
+            duration: updatedCall?.duration,
+            end_time: updatedCall?.end_time
+        });
+        
     } catch (error) {
         console.error('Error updating call hangup:', error);
         try {
@@ -521,18 +543,20 @@ async function handleRecordingSaved(data) {
     // Try to update database with explicit transaction
     try {
         await dbRun('BEGIN IMMEDIATE');
-        await dbRun(`
+        
+        const result = await dbRun(`
             UPDATE calls 
             SET recording_url = ?
             WHERE call_id = ?
         `, [recordingUrl, callId]);
+        
         await dbRun('COMMIT');
         
-        console.log('Database updated with recording URL');
+        console.log('Database updated with recording URL, rows affected:', result?.changes || 'unknown');
         
         // Verify the update worked
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log('Updated call record:', updatedCall);
+        console.log('Updated call record - has recording URL:', !!updatedCall?.recording_url);
         
     } catch (error) {
         console.error('Database update failed:', error);
