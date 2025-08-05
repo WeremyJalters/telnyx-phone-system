@@ -2,8 +2,8 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import pkg from 'pg';
-const { Pool } = pkg;
+import sqlite3 from 'sqlite3';
+import { promisify } from 'util';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -11,22 +11,28 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize PostgreSQL connection
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/telnyx_calls',
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
+// Force single database instance with absolute path
+const dbPath = process.env.DATABASE_PATH || join(__dirname, 'call_records.db');
+console.log('Database path:', dbPath);
 
-console.log('Database connection configured for:', process.env.DATABASE_URL ? 'Production PostgreSQL' : 'Local PostgreSQL');
-
-// Test database connection
-pool.query('SELECT NOW()', (err, result) => {
+const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
-        console.error('Database connection error:', err);
+        console.error('Error opening database:', err);
     } else {
-        console.log('Database connected successfully at:', result.rows[0].now);
+        console.log('Connected to SQLite database at:', dbPath);
     }
 });
+
+// Enable WAL mode for better concurrency
+db.exec('PRAGMA journal_mode = WAL;');
+db.exec('PRAGMA synchronous = NORMAL;');
+db.exec('PRAGMA cache_size = 1000;');
+db.exec('PRAGMA temp_store = memory;');
+
+// Promisify database methods
+const dbRun = promisify(db.run.bind(db));
+const dbAll = promisify(db.all.bind(db));
+const dbGet = promisify(db.get.bind(db));
 
 // Middleware
 app.use(express.json());
@@ -34,19 +40,19 @@ app.use(express.static(join(__dirname, 'public')));
 
 // Initialize database tables
 async function initDatabase() {
-    console.log('Initializing PostgreSQL database tables...');
+    console.log('Initializing SQLite database tables...');
     
     try {
-        await dbQuery(`
+        await dbRun(`
             CREATE TABLE IF NOT EXISTS calls (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 call_id TEXT UNIQUE,
                 direction TEXT,
                 from_number TEXT,
                 to_number TEXT,
                 status TEXT,
-                start_time TIMESTAMPTZ,
-                end_time TIMESTAMPTZ,
+                start_time DATETIME,
+                end_time DATETIME,
                 duration INTEGER,
                 recording_url TEXT,
                 transcript TEXT,
@@ -54,14 +60,14 @@ async function initDatabase() {
                 customer_info TEXT,
                 contractor_info TEXT,
                 notes TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
         console.log('Calls table initialized');
         
-        await dbQuery(`
+        await dbRun(`
             CREATE TABLE IF NOT EXISTS customers (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone_number TEXT UNIQUE,
                 name TEXT,
                 address TEXT,
@@ -69,14 +75,14 @@ async function initDatabase() {
                 urgency TEXT,
                 notes TEXT,
                 status TEXT DEFAULT 'new',
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
         console.log('Customers table initialized');
         
-        await dbQuery(`
+        await dbRun(`
             CREATE TABLE IF NOT EXISTS contractors (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone_number TEXT UNIQUE,
                 name TEXT,
                 company TEXT,
@@ -85,7 +91,7 @@ async function initDatabase() {
                 rating REAL,
                 availability TEXT,
                 notes TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
         console.log('Contractors table initialized');
@@ -146,30 +152,41 @@ async function handleIncomingCall(data) {
 
     console.log('Handling incoming call:', callId, 'from', fromNumber, 'to', toNumber);
 
-    // Store call record with better error handling
+    // Store call record with better error handling AND memory backup
     try {
         console.log('Attempting to insert call record into database...');
         
-        const result = await dbQuery(`
-            INSERT INTO calls 
+        const result = await dbRun(`
+            INSERT OR REPLACE INTO calls 
             (call_id, direction, from_number, to_number, status, start_time, call_type)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (call_id) DO UPDATE SET
-            status = EXCLUDED.status,
-            start_time = EXCLUDED.start_time
-            RETURNING id
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
         
-        console.log('Call record inserted successfully. Row ID:', result.rows[0].id);
+        console.log('Call record inserted successfully. Row ID:', result);
         
         // Verify the insert worked
-        const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = $1', [callId]);
+        const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Verified inserted call:', insertedCall);
         
     } catch (dbError) {
         console.error('Database error inserting call:', dbError);
         console.error('Database error stack:', dbError.stack);
     }
+    
+    // ALWAYS store in memory as backup
+    const memoryCall = {
+        id: callId,
+        call_id: callId,
+        direction: 'inbound',
+        from_number: fromNumber,
+        to_number: toNumber,
+        status: 'initiated',
+        start_time: new Date().toISOString(),
+        call_type: 'customer_inquiry',
+        timestamp: new Date().toISOString()
+    };
+    callHistory.unshift(memoryCall);
+    console.log('Call stored in memory backup');
 
     try {
         // Answer the call using direct HTTP API
@@ -405,7 +422,7 @@ async function handleCallHangup(data) {
     }
 }
 
-// Handle recording saved
+// Handle recording saved with robust fallback
 async function handleRecordingSaved(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
     const recordingUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
@@ -415,60 +432,43 @@ async function handleRecordingSaved(data) {
     console.log('Recording URL:', recordingUrl);
     console.log('Recording ID:', recordingId);
     
+    // ALWAYS update memory first (guaranteed to work)
+    const memoryCall = callHistory.find(call => call.call_id === callId);
+    if (memoryCall) {
+        memoryCall.recording_url = recordingUrl;
+        memoryCall.recording_id = recordingId;
+        memoryCall.recordingUrl = recordingUrl; // alternative property name
+        console.log('Recording URL stored in memory backup');
+    } else {
+        // Create new memory entry if not found
+        callHistory.unshift({
+            id: callId,
+            call_id: callId,
+            recording_url: recordingUrl,
+            recording_id: recordingId,
+            recordingUrl: recordingUrl,
+            timestamp: new Date().toISOString(),
+            source: 'recording_webhook'
+        });
+        console.log('New recording entry created in memory');
+    }
+    
+    // Try to update database (may fail but recording is safe in memory)
     try {
-        // Try multiple update approaches to handle database connection issues
-        let updateResult;
-        let updatedCall;
-        
-        // First attempt with PostgreSQL syntax (if we migrate)
-        try {
-            updateResult = await dbQuery(`
-                UPDATE calls 
-                SET recording_url = $1
-                WHERE call_id = $2
-                RETURNING *
-            `, [recordingUrl, callId]);
-            updatedCall = updateResult.rows[0];
-        } catch (pgError) {
-            console.log('PostgreSQL update failed, trying SQLite syntax...');
-            
-            // Fallback to SQLite syntax  
-            updateResult = await dbRun(`
-                UPDATE calls 
-                SET recording_url = ?
-                WHERE call_id = ?
-            `, [recordingUrl, callId]);
-            
-            // Verify SQLite update
-            updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        }
+        await dbRun(`
+            UPDATE calls 
+            SET recording_url = ?
+            WHERE call_id = ?
+        `, [recordingUrl, callId]);
         
         console.log('Database updated with recording URL');
+        
+        // Verify the update worked
+        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Updated call record:', updatedCall);
         
-        // If database update failed, store in memory as backup
-        if (!updatedCall) {
-            console.log('Database update failed, storing in memory backup...');
-            callHistory.forEach(call => {
-                if (call.id === callId) {
-                    call.recordingUrl = recordingUrl;
-                    call.recordingId = recordingId;
-                }
-            });
-        }
-        
     } catch (error) {
-        console.error('Error updating call with recording URL:', error);
-        
-        // Fallback: store in memory
-        console.log('Using memory fallback for recording...');
-        const memoryCall = {
-            id: callId,
-            recordingUrl: recordingUrl,
-            recordingId: recordingId,
-            timestamp: new Date().toISOString()
-        };
-        callHistory.unshift(memoryCall);
+        console.error('Database update failed, but recording is safe in memory:', error);
     }
 
     // Generate transcript
