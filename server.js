@@ -23,11 +23,12 @@ const db = new sqlite3.Database(dbPath, (err) => {
     }
 });
 
-// Enable WAL mode for better concurrency
+// Enable WAL mode for better concurrency - but make it synchronous for reliability
 db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA synchronous = NORMAL;');
+db.exec('PRAGMA synchronous = FULL;'); // Changed from NORMAL to FULL for data integrity
 db.exec('PRAGMA cache_size = 1000;');
 db.exec('PRAGMA temp_store = memory;');
+db.exec('PRAGMA busy_timeout = 30000;'); // 30 second timeout for busy database
 
 // Promisify database methods
 const dbRun = promisify(db.run.bind(db));
@@ -161,9 +162,12 @@ async function handleIncomingCall(data) {
 
     console.log('Handling incoming call:', callId, 'from', fromNumber, 'to', toNumber);
 
-    // Store call record in database
+    // Store call record in database with explicit transaction
     try {
         console.log('Attempting to insert call record into database...');
+        
+        // Use BEGIN IMMEDIATE for better concurrency control
+        await dbRun('BEGIN IMMEDIATE');
         
         const result = await dbRun(`
             INSERT OR REPLACE INTO calls 
@@ -171,14 +175,27 @@ async function handleIncomingCall(data) {
             VALUES (?, ?, ?, ?, ?, ?, ?)
         `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
         
-        console.log('Call record inserted successfully. Row ID:', result);
+        // Commit the transaction
+        await dbRun('COMMIT');
         
-        // Verify the insert worked
-        const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Call record inserted successfully. Row ID:', result?.lastID);
+        
+        // Verify the insert worked with a fresh query
+        const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = ? ORDER BY id DESC LIMIT 1', [callId]);
         console.log('Verified inserted call:', insertedCall);
+        
+        // Double check total count for debugging
+        const totalCount = await dbGet('SELECT COUNT(*) as count FROM calls');
+        console.log('Total calls after insert:', totalCount);
         
     } catch (dbError) {
         console.error('Database error inserting call:', dbError);
+        // Rollback on error
+        try {
+            await dbRun('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('Error rolling back transaction:', rollbackError);
+        }
     }
 
     try {
@@ -261,11 +278,25 @@ async function handleIncomingCall(data) {
 // Handle call answered
 async function handleCallAnswered(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
-    await dbRun(`
-        UPDATE calls 
-        SET status = 'answered'
-        WHERE call_id = ?
-    `, [callId]);
+    
+    try {
+        await dbRun('BEGIN IMMEDIATE');
+        await dbRun(`
+            UPDATE calls 
+            SET status = 'answered'
+            WHERE call_id = ?
+        `, [callId]);
+        await dbRun('COMMIT');
+        
+        console.log('Call status updated to answered for:', callId);
+    } catch (error) {
+        console.error('Error updating call status:', error);
+        try {
+            await dbRun('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('Error rolling back transaction:', rollbackError);
+        }
+    }
 
     activeCalls.set(callId, {
         status: 'active',
@@ -447,11 +478,24 @@ async function handleCallHangup(data) {
     const callInfo = activeCalls.get(callId);
     const duration = callInfo ? Math.floor((new Date() - callInfo.startTime) / 1000) : 0;
 
-    await dbRun(`
-        UPDATE calls 
-        SET status = 'completed', end_time = ?, duration = ?
-        WHERE call_id = ?
-    `, [endTime, duration, callId]);
+    try {
+        await dbRun('BEGIN IMMEDIATE');
+        await dbRun(`
+            UPDATE calls 
+            SET status = 'completed', end_time = ?, duration = ?
+            WHERE call_id = ?
+        `, [endTime, duration, callId]);
+        await dbRun('COMMIT');
+        
+        console.log('Call hangup processed for:', callId, 'Duration:', duration + 's');
+    } catch (error) {
+        console.error('Error updating call hangup:', error);
+        try {
+            await dbRun('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('Error rolling back transaction:', rollbackError);
+        }
+    }
 
     activeCalls.delete(callId);
 
@@ -474,13 +518,15 @@ async function handleRecordingSaved(data) {
     console.log('Recording URL:', recordingUrl);
     console.log('Recording ID:', recordingId);
     
-    // Try to update database
+    // Try to update database with explicit transaction
     try {
+        await dbRun('BEGIN IMMEDIATE');
         await dbRun(`
             UPDATE calls 
             SET recording_url = ?
             WHERE call_id = ?
         `, [recordingUrl, callId]);
+        await dbRun('COMMIT');
         
         console.log('Database updated with recording URL');
         
@@ -490,6 +536,11 @@ async function handleRecordingSaved(data) {
         
     } catch (error) {
         console.error('Database update failed:', error);
+        try {
+            await dbRun('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('Error rolling back transaction:', rollbackError);
+        }
     }
 
     // Generate transcript
@@ -682,7 +733,9 @@ app.get('/api/calls', async (req, res) => {
         let databaseWorking = false;
         
         try {
-            // Test database connection
+            // Test database connection with a small delay to ensure any pending writes complete
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
             const testQuery = await dbGet('SELECT COUNT(*) as count FROM calls');
             console.log('Database test - total calls:', testQuery);
             
@@ -702,12 +755,17 @@ app.get('/api/calls', async (req, res) => {
             console.log('Query result - found calls:', calls.length);
             databaseWorking = true;
             
+            // If we found calls, log them for debugging
+            if (calls.length > 0) {
+                console.log('Sample call:', JSON.stringify(calls[0], null, 2));
+            }
+            
         } catch (dbError) {
             console.log('Database not working, using memory fallback:', dbError.message);
             calls = [];
         }
         
-        console.log('Final call details:', JSON.stringify(calls, null, 2));
+        console.log('Final call details count:', calls.length);
         
         res.json({
             calls: calls,
