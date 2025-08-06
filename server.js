@@ -364,7 +364,8 @@ async function handleIncomingCall(data, timestamp) {
                         'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
                     },
                     body: JSON.stringify({
-                        payload: "Thank you for calling Weather Pro Solutions, your trusted roofing and exterior specialists. If this is an emergency, press 1. For general inquiries about roofing, siding, or gutters, press 2. To speak with a representative, press 0.",
+                        payload: "Thank you for calling Weather Pro Solutions, your trusted flood damage restoration specialists. We understand water damage is urgent and stressful. If this is a flooding emergency requiring immediate water extraction, press 1. For insurance claims assistance and damage assessment, press 2. For mold remediation and restoration services, press 3. To speak directly with our emergency response team, press 0.";
+",
                         voice: 'female',
                         language: 'en-US',
                         minimum_digits: 1,
