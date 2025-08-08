@@ -147,6 +147,11 @@ async function initDatabase() {
                 customer_info TEXT,
                 contractor_info TEXT,
                 notes TEXT,
+                customer_zip_code TEXT,
+                customer_name TEXT,
+                lead_quality TEXT,
+                zapier_sent BOOLEAN DEFAULT FALSE,
+                zapier_sent_at DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
@@ -158,6 +163,7 @@ async function initDatabase() {
                 phone_number TEXT UNIQUE,
                 name TEXT,
                 address TEXT,
+                zip_code TEXT,
                 damage_type TEXT,
                 urgency TEXT,
                 notes TEXT,
@@ -195,7 +201,7 @@ async function initDatabase() {
 
 // Call state management
 const activeCalls = new Map();
-const conferenceRooms = new Map();
+const pendingHumanCalls = new Map(); // Track calls waiting for human connection
 
 // Routes
 app.get('/', (req, res) => {
@@ -340,7 +346,7 @@ async function handleCallAnswered(data) {
 
         // Check if this is a human representative call (outbound call to human)
         if (existingCall.call_type === 'human_representative') {
-            console.log('Human representative answered, connecting to conference');
+            console.log('Human representative answered, initiating bridge');
             await handleHumanRepresentativeAnswered(callId, existingCall);
         }
 
@@ -379,64 +385,65 @@ async function handleHumanRepresentativeAnswered(humanCallId, humanCallRecord) {
     try {
         console.log('Human representative answered call:', humanCallId);
         
-        // Find the conference room for this human call
-        let conferenceId = null;
+        // Find the customer call waiting for this human
         let customerCallId = null;
         
-        for (const [confId, conf] of conferenceRooms) {
-            if (conf.human === humanCallId) {
-                conferenceId = confId;
-                customerCallId = conf.customer;
+        for (const [custId, humanId] of pendingHumanCalls) {
+            if (humanId === humanCallId) {
+                customerCallId = custId;
                 break;
             }
         }
         
-        if (!conferenceId) {
-            console.error('No conference room found for human call:', humanCallId);
+        if (!customerCallId) {
+            console.error('No customer call found waiting for human:', humanCallId);
+            await speakToCall(humanCallId, "I apologize, there was a system error. No customer is waiting. Please hang up.");
             return;
         }
         
-        console.log('Found conference room:', conferenceId, 'for customer:', customerCallId);
+        console.log('Found customer call waiting:', customerCallId, 'for human:', humanCallId);
         
         // Greet the human representative with context
-        await speakToCall(humanCallId, "Hello, this is Weather Pro Solutions. You have a customer waiting on the line who needs to speak with a representative. You will now be connected to the customer.");
+        await speakToCall(humanCallId, "Hello, this is Weather Pro Solutions. You have a customer waiting on the line who needs roofing assistance. Connecting you now to the customer on a recorded line.");
         
-        // Transfer human to the conference room (where customer is waiting)
+        // Wait for greeting to finish, then bridge the calls
         setTimeout(async () => {
-            const transferResponse = await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/transfer`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                    'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
-                },
-                body: JSON.stringify({
-                    to: `conference:${conferenceId}`
-                })
-            });
+            try {
+                console.log('Bridging customer and human calls...');
+                const bridgeResponse = await fetch(`https://api.telnyx.com/v2/calls/${customerCallId}/actions/bridge`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+                    },
+                    body: JSON.stringify({
+                        call_control_id: humanCallId
+                    })
+                });
 
-            if (transferResponse.ok) {
-                console.log('Human representative transferred to conference successfully');
-                
-                // Update conference room status
-                const conference = conferenceRooms.get(conferenceId);
-                if (conference) {
-                    conference.status = 'connected';
-                    conference.connectedAt = new Date();
-                    conferenceRooms.set(conferenceId, conference);
+                if (bridgeResponse.ok) {
+                    console.log('Successfully bridged customer and human calls');
+                    
+                    // Remove from pending
+                    pendingHumanCalls.delete(customerCallId);
+                    
+                    // Update call records
+                    await dbRun(`
+                        UPDATE calls 
+                        SET call_type = 'human_connected', notes = 'Successfully connected to human representative'
+                        WHERE call_id = ?
+                    `, [customerCallId]);
+                    
+                } else {
+                    const errorData = await bridgeResponse.text();
+                    console.error('Failed to bridge calls:', bridgeResponse.status, errorData);
+                    await speakToCall(humanCallId, "I apologize, there was a technical issue connecting you to the customer. Please hang up.");
+                    await speakToCall(customerCallId, "I apologize, but we're having technical difficulties. Please call back in a few minutes.");
                 }
-                
-                // Update call records
-                await dbRun(`
-                    UPDATE calls 
-                    SET call_type = 'human_connected', notes = 'Successfully connected to human representative'
-                    WHERE call_id = ?
-                `, [customerCallId]);
-                
-            } else {
-                const errorData = await transferResponse.text();
-                console.error('Failed to transfer human to conference:', transferResponse.status, errorData);
-                await speakToCall(humanCallId, "I apologize, there was a technical issue connecting you to the customer. Please hang up and we'll try to reach you again.");
+            } catch (bridgeError) {
+                console.error('Error during bridge operation:', bridgeError);
+                await speakToCall(humanCallId, "I apologize, there was a technical issue. Please hang up.");
             }
         }, 3000); // Give human rep 3 seconds to hear the greeting
         
@@ -536,19 +543,15 @@ async function collectCustomerInfo(callId) {
     }
 }
 
-// Connect to human representative
+// Connect to human representative - SIMPLIFIED VERSION
 async function connectToHuman(callId) {
     try {
         console.log('Connecting customer to human representative for call:', callId);
         
         // Configuration for human representative
-        const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER || '+18609389491'; // Replace with actual number
+        const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER || '+18609389491'; // Your configured number
         
-        if (humanPhoneNumber === '+1234567890') {
-            console.error('HUMAN_PHONE_NUMBER not configured in environment variables');
-            await speakToCall(callId, "I apologize, but our representative phone number is not configured. Please call back later or leave a voicemail.");
-            return;
-        }
+        console.log('Using human phone number:', humanPhoneNumber);
 
         // Update call record to show human connection attempt
         await dbRun(`
@@ -560,36 +563,11 @@ async function connectToHuman(callId) {
         // First, tell the customer what's happening
         await speakToCall(callId, "Connecting you now. Please remain on the line while we dial our representative.");
 
-        // Create a conference room for the three-way call
-        const conferenceId = `human_${Date.now()}`;
-        
-        console.log('Creating conference room:', conferenceId);
-        
-        // Transfer customer to conference room
-        const transferResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/transfer`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
-            },
-            body: JSON.stringify({
-                to: `conference:${conferenceId}`,
-                // Keep recording active during transfer
-                record: 'record-from-answer'
-            })
-        });
+        // Wait a moment before starting the call
+        await new Promise(resolve => setTimeout(resolve, 3000));
 
-        if (!transferResponse.ok) {
-            const errorData = await transferResponse.text();
-            console.error('Failed to transfer customer to conference:', transferResponse.status, errorData);
-            await speakToCall(callId, "I apologize, but we're having technical difficulties. Please try calling back in a few minutes.");
-            return;
-        }
-
-        console.log('Customer transferred to conference successfully');
-
-        // Now call the human representative
+        // Call the human representative
+        console.log('Calling human representative at:', humanPhoneNumber);
         const humanCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
             method: 'POST',
             headers: {
@@ -601,7 +579,6 @@ async function connectToHuman(callId) {
                 to: humanPhoneNumber,
                 from: process.env.TELNYX_PHONE_NUMBER,
                 webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls',
-                // Automatically transfer to conference when answered
                 machine_detection: 'disabled',
                 timeout_secs: 30
             })
@@ -610,7 +587,10 @@ async function connectToHuman(callId) {
         if (!humanCallResponse.ok) {
             const errorData = await humanCallResponse.text();
             console.error('Failed to call human representative:', humanCallResponse.status, errorData);
-            await speakToCall(callId, "I apologize, but we're unable to reach our representative right now. Please leave a detailed message and we'll call you back shortly.");
+            console.error('Full error response:', errorData);
+            
+            // More specific error message
+            await speakToCall(callId, "I apologize, but we're unable to reach our representative right now. Please leave a detailed message and someone will call you back within one hour.");
             return;
         }
 
@@ -635,20 +615,29 @@ async function connectToHuman(callId) {
             `Calling representative for customer call ${callId}`
         ]);
 
-        // Store conference information
-        conferenceRooms.set(conferenceId, {
-            customer: callId,
-            human: humanCallId,
-            created: new Date(),
-            type: 'human_transfer'
-        });
+        // Track the relationship between customer and human calls
+        pendingHumanCalls.set(callId, humanCallId);
 
         // Set up a timeout to handle if human doesn't answer
         setTimeout(async () => {
-            const conference = conferenceRooms.get(conferenceId);
-            if (conference && conference.status !== 'connected') {
+            if (pendingHumanCalls.has(callId)) {
                 console.log('Human representative did not answer within timeout');
-                await handleHumanNoAnswer(callId, conferenceId);
+                
+                // Hangup the human call attempt
+                try {
+                    await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json',
+                            'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+                        }
+                    });
+                } catch (hangupError) {
+                    console.error('Error hanging up human call:', hangupError);
+                }
+                
+                await handleHumanNoAnswer(callId);
             }
         }, 35000); // 35 second timeout
 
@@ -659,17 +648,17 @@ async function connectToHuman(callId) {
 }
 
 // Handle when human representative doesn't answer
-async function handleHumanNoAnswer(callId, conferenceId) {
+async function handleHumanNoAnswer(callId) {
     try {
         console.log('Human representative did not answer, providing fallback options');
         
-        // Remove from conference tracking
-        conferenceRooms.delete(conferenceId);
+        // Remove from pending
+        pendingHumanCalls.delete(callId);
         
         // Speak to the customer with options
-        await speakToCall(callId, "I apologize, but our representative is currently unavailable. Please choose from the following options: Press 2 to leave a detailed message about your roofing needs, or stay on the line to hear our main menu again.");
+        await speakToCall(callId, "I apologize, but our representative is currently unavailable. Please leave a detailed message about your roofing needs and we'll call you back within one hour. You can also call us directly during business hours, Monday through Friday, 8 AM to 6 PM. Please start your message after the beep.");
         
-        // Set up gather for customer choice
+        // Set up message recording
         setTimeout(async () => {
             await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/gather_using_speak`, {
                 method: 'POST',
@@ -679,12 +668,12 @@ async function handleHumanNoAnswer(callId, conferenceId) {
                     'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
                 },
                 body: JSON.stringify({
-                    payload: "Press 2 to leave a message, or any other key to hear our menu again.",
+                    payload: "Please leave your message now. Include your name, phone number, address, and details about your roofing needs. Press pound when finished.",
                     voice: 'female',
                     language: 'en-US',
-                    minimum_digits: 1,
-                    maximum_digits: 1,
-                    timeout_millis: 10000,
+                    minimum_digits: 0,
+                    maximum_digits: 0,
+                    timeout_millis: 60000, // 60 seconds for message
                     terminating_digit: '#'
                 })
             });
@@ -766,17 +755,34 @@ async function handleCallHangup(data) {
             end_time: updatedCall?.end_time
         });
         
+        // Check if this call needs to be sent to Zapier
+        if (existingCall.call_type === 'customer_inquiry' || existingCall.call_type === 'human_connected') {
+            await scheduleZapierWebhook(callId);
+        }
+        
     } catch (error) {
         console.error('Error updating call hangup:', error);
     }
 
     activeCalls.delete(callId);
 
-    // Clean up any conference rooms
-    for (const [confId, conf] of conferenceRooms) {
-        if (conf.customer === callId || conf.contractor === callId) {
-            conferenceRooms.delete(confId);
-            break;
+    // Clean up any pending human calls
+    if (pendingHumanCalls.has(callId)) {
+        const humanCallId = pendingHumanCalls.get(callId);
+        pendingHumanCalls.delete(callId);
+        
+        // Hang up the human call if it's still ringing
+        try {
+            await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+                }
+            });
+        } catch (hangupError) {
+            console.error('Error hanging up human call after customer hangup:', hangupError);
         }
     }
 }
@@ -825,6 +831,11 @@ async function handleRecordingSaved(data) {
             hasRecording: !!updatedCall?.recording_url
         });
         
+        // If call is completed and has recording, check if we should send to Zapier
+        if (updatedCall?.status === 'completed' && recordingUrl) {
+            await scheduleZapierWebhook(callId);
+        }
+        
     } catch (error) {
         console.error('Database update failed:', error);
         try {
@@ -848,8 +859,153 @@ async function generateTranscript(callId, recordingUrl) {
         // - AssemblyAI
         
         console.log(`Transcript generation requested for call ${callId}`);
+        
+        // For now, we'll update the call with a placeholder
+        await dbRun(`
+            UPDATE calls 
+            SET transcript = 'Transcript generation in progress...'
+            WHERE call_id = ?
+        `, [callId]);
+        
     } catch (error) {
         console.error('Transcript generation error:', error);
+    }
+}
+
+// Schedule Zapier webhook for completed calls
+async function scheduleZapierWebhook(callId) {
+    try {
+        console.log('Checking if call should be sent to Zapier:', callId);
+        
+        const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        
+        if (!call) {
+            console.error('Call not found for Zapier webhook:', callId);
+            return;
+        }
+        
+        // Only send customer inquiry calls that are completed and haven't been sent yet
+        const shouldSend = (
+            (call.call_type === 'customer_inquiry' || call.call_type === 'human_connected') &&
+            call.status === 'completed' &&
+            call.recording_url &&
+            !call.zapier_sent
+        );
+        
+        if (!shouldSend) {
+            console.log('Call does not meet criteria for Zapier webhook:', {
+                callType: call.call_type,
+                status: call.status,
+                hasRecording: !!call.recording_url,
+                alreadySent: call.zapier_sent
+            });
+            return;
+        }
+        
+        // Wait a bit for transcript to be generated (if applicable)
+        setTimeout(async () => {
+            await sendToZapier(callId);
+        }, 5000); // 5 second delay
+        
+    } catch (error) {
+        console.error('Error scheduling Zapier webhook:', error);
+    }
+}
+
+// Send call data to Zapier webhook
+async function sendToZapier(callId) {
+    try {
+        const zapierWebhookUrl = process.env.ZAPIER_WEBHOOK_URL;
+        
+        if (!zapierWebhookUrl) {
+            console.log('Zapier webhook URL not configured, skipping send for call:', callId);
+            return;
+        }
+        
+        console.log('Sending call to Zapier:', callId);
+        
+        // Get the latest call data
+        const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        
+        if (!call) {
+            console.error('Call not found when sending to Zapier:', callId);
+            return;
+        }
+        
+        // Prepare the data to send to Zapier
+        const zapierData = {
+            // Call identification
+            call_id: call.call_id,
+            timestamp: new Date().toISOString(),
+            
+            // Customer information
+            customer_phone: call.from_number,
+            customer_name: call.customer_name || 'Name collected during call',
+            customer_zip_code: call.customer_zip_code || 'Zip code collected during call',
+            
+            // Call details
+            call_duration_seconds: call.duration || 0,
+            call_start_time: call.start_time,
+            call_end_time: call.end_time,
+            call_type: call.call_type,
+            call_status: call.status,
+            
+            // Recording and transcript
+            recording_url: call.recording_url,
+            transcript: call.transcript,
+            
+            // Lead quality information
+            lead_quality: call.lead_quality || 'To be determined',
+            notes: call.notes || '',
+            
+            // Business information
+            business_phone: call.to_number,
+            
+            // Metadata
+            source: 'Weather Pro Solutions Phone System',
+            lead_source: 'Inbound Phone Call'
+        };
+        
+        console.log('Sending data to Zapier:', JSON.stringify(zapierData, null, 2));
+        
+        // Send to Zapier
+        const response = await fetch(zapierWebhookUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(zapierData)
+        });
+        
+        if (response.ok) {
+            console.log('Successfully sent call to Zapier:', callId);
+            
+            // Mark as sent in database
+            await dbRun(`
+                UPDATE calls 
+                SET zapier_sent = TRUE, zapier_sent_at = ?
+                WHERE call_id = ?
+            `, [new Date().toISOString(), callId]);
+            
+        } else {
+            const errorData = await response.text();
+            console.error('Failed to send to Zapier:', response.status, errorData);
+            
+            // Optionally retry after a delay
+            setTimeout(async () => {
+                console.log('Retrying Zapier webhook for call:', callId);
+                await sendToZapier(callId);
+            }, 30000); // Retry after 30 seconds
+        }
+        
+    } catch (error) {
+        console.error('Error sending to Zapier:', error);
+        
+        // Optionally retry after a delay
+        setTimeout(async () => {
+            console.log('Retrying Zapier webhook after error for call:', callId);
+            await sendToZapier(callId);
+        }, 60000); // Retry after 1 minute
     }
 }
 
@@ -953,10 +1109,8 @@ app.post('/api/three-way-call', async (req, res) => {
     try {
         const { customerNumber, contractorNumber } = req.body;
         
-        // Create conference room
-        const conferenceId = `conf_${Date.now()}`;
-
-        // Call customer
+        // For three-way calls, we'll use the same bridge approach
+        // First call customer
         const customerCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
             method: 'POST',
             headers: {
@@ -971,7 +1125,7 @@ app.post('/api/three-way-call', async (req, res) => {
             })
         });
 
-        // Call contractor
+        // Call contractor  
         const contractorCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
             method: 'POST',
             headers: {
@@ -987,27 +1141,79 @@ app.post('/api/three-way-call', async (req, res) => {
         });
 
         if (!customerCallResponse.ok || !contractorCallResponse.ok) {
-            throw new Error('Failed to create conference calls');
+            throw new Error('Failed to create three-way calls');
         }
 
         const customerCall = await customerCallResponse.json();
         const contractorCall = await contractorCallResponse.json();
 
-        // Store conference info
-        conferenceRooms.set(conferenceId, {
-            customer: customerCall.data.call_control_id,
-            contractor: contractorCall.data.call_control_id,
-            created: new Date()
-        });
-
         res.json({ 
             success: true,
-            conferenceId,
             customerCallId: customerCall.data.call_control_id,
             contractorCallId: contractorCall.data.call_control_id
         });
     } catch (error) {
         console.error('Error creating three-way call:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Update call with customer information (manual entry by rep)
+app.post('/api/calls/:callId/update-customer-info', async (req, res) => {
+    try {
+        const { callId } = req.params;
+        const { customerName, zipCode, leadQuality, notes } = req.body;
+        
+        console.log('Updating customer info for call:', callId, {
+            customerName,
+            zipCode,
+            leadQuality,
+            notes
+        });
+        
+        const result = await dbRun(`
+            UPDATE calls 
+            SET customer_name = ?, customer_zip_code = ?, lead_quality = ?, notes = ?
+            WHERE call_id = ?
+        `, [customerName, zipCode, leadQuality, notes, callId]);
+        
+        if (result.changes === 0) {
+            return res.status(404).json({ error: 'Call not found' });
+        }
+        
+        console.log('Customer info updated successfully for call:', callId);
+        
+        // Check if we should send to Zapier now that we have customer info
+        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        if (updatedCall && updatedCall.status === 'completed' && updatedCall.recording_url && !updatedCall.zapier_sent) {
+            await scheduleZapierWebhook(callId);
+        }
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error updating customer info:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Manually trigger Zapier webhook for a call
+app.post('/api/calls/:callId/send-to-zapier', async (req, res) => {
+    try {
+        const { callId } = req.params;
+        
+        console.log('Manual Zapier trigger requested for call:', callId);
+        
+        const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        
+        if (!call) {
+            return res.status(404).json({ error: 'Call not found' });
+        }
+        
+        await sendToZapier(callId);
+        
+        res.json({ success: true, message: 'Zapier webhook triggered' });
+    } catch (error) {
+        console.error('Error manually triggering Zapier:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -1095,13 +1301,13 @@ app.get('/api/calls/:callId', async (req, res) => {
 // Add customer
 app.post('/api/customers', async (req, res) => {
     try {
-        const { phoneNumber, name, address, damageType, urgency, notes } = req.body;
+        const { phoneNumber, name, address, zipCode, damageType, urgency, notes } = req.body;
         
         await dbRun(`
             INSERT OR REPLACE INTO customers 
-            (phone_number, name, address, damage_type, urgency, notes)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `, [phoneNumber, name, address, damageType, urgency, notes]);
+            (phone_number, name, address, zip_code, damage_type, urgency, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, [phoneNumber, name, address, zipCode, damageType, urgency, notes]);
 
         res.json({ success: true });
     } catch (error) {
@@ -1151,6 +1357,13 @@ app.get('/api/dashboard', async (req, res) => {
         const totalCustomers = await dbGet('SELECT COUNT(*) as count FROM customers');
         const totalContractors = await dbGet('SELECT COUNT(*) as count FROM contractors');
 
+        // Zapier stats
+        const zapierSent = await dbGet('SELECT COUNT(*) as count FROM calls WHERE zapier_sent = TRUE');
+        const zapierPending = await dbGet(`
+            SELECT COUNT(*) as count FROM calls 
+            WHERE status = 'completed' AND recording_url IS NOT NULL AND zapier_sent = FALSE
+        `);
+
         // Also get recent calls for debugging
         const recentCalls = await dbAll('SELECT * FROM calls ORDER BY start_time DESC LIMIT 10');
         console.log('Recent calls for dashboard:', recentCalls);
@@ -1166,7 +1379,9 @@ app.get('/api/dashboard', async (req, res) => {
             todayCalls: todayCalls.count,
             activeCalls: activeCalls.count,
             totalCustomers: totalCustomers.count,  
-            totalContractors: totalContractors.count
+            totalContractors: totalContractors.count,
+            zapierSent: zapierSent.count,
+            zapierPending: zapierPending.count
         });
     } catch (error) {
         console.error('Error fetching dashboard data:', error);
@@ -1177,7 +1392,7 @@ app.get('/api/dashboard', async (req, res) => {
 // Serve static files for dashboard
 app.use(express.static('public'));
 
-// Calls viewer page
+// Calls viewer page with enhanced customer info management
 app.get('/calls', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -1273,6 +1488,53 @@ app.get('/calls', (req, res) => {
             background: #ccc;
             cursor: not-allowed;
         }
+        .zapier-button {
+            background: #FF6B35;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .zapier-button:hover {
+            background: #E55A2B;
+        }
+        .zapier-button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .zapier-sent {
+            background: #4CAF50;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 10px;
+            text-transform: uppercase;
+        }
+        .customer-info-section {
+            background: #e8f5e8;
+            border-radius: 5px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        .info-input {
+            width: 100%;
+            padding: 8px;
+            margin: 5px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .save-info-button {
+            background: #2196F3;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 12px;
+        }
         .no-calls {
             text-align: center;
             color: #666;
@@ -1301,7 +1563,7 @@ app.get('/calls', (req, res) => {
 <body>
     <div class="header">
         <h1>📞 Weather Pro Solutions</h1>
-        <p>Call Records & Recordings</p>
+        <p>Call Records & Lead Management</p>
     </div>
 
     <div class="calls-container">
@@ -1339,8 +1601,11 @@ app.get('/calls', (req, res) => {
                                 <div class="call-numbers">
                                     \${call.from_number} → \${call.to_number}
                                 </div>
-                                <div class="call-status status-\${call.status}">
-                                    \${call.status}
+                                <div>
+                                    <div class="call-status status-\${call.status}">
+                                        \${call.status}
+                                    </div>
+                                    \${call.zapier_sent ? '<span class="zapier-sent">Sent to Zapier</span>' : ''}
                                 </div>
                             </div>
                             
@@ -1368,6 +1633,9 @@ app.get('/calls', (req, res) => {
                                             \`<a href="\${call.recording_url}" target="_blank" class="recording-button">🎵 Play Recording</a>\` :
                                             '<button class="recording-button" disabled>No Recording</button>'
                                         }
+                                        \${call.recording_url && !call.zapier_sent ? 
+                                            \`<button class="zapier-button" onclick="sendToZapier('\${call.call_id}')">📤 Send to Zapier</button>\` : ''
+                                        }
                                     </div>
                                 </div>
                                 <div class="detail-item">
@@ -1376,189 +1644,19 @@ app.get('/calls', (req, res) => {
                                 </div>
                             </div>
                             
-                            \${call.transcript ? \`
-                                <div style="margin-top: 15px; padding: 10px; background: #e8f5e8; border-radius: 5px;">
-                                    <div class="detail-label">Transcript</div>
-                                    <div class="detail-value">\${call.transcript}</div>
-                                </div>
-                            \` : ''}
-                        </div>
-                    \`;
-                });
-                
-                callsList.innerHTML = html;
-                
-            } catch (error) {
-                console.error('Error loading calls:', error);
-                callsList.innerHTML = \`<div class="no-calls">Error loading calls: \${error.message}</div>\`;
-            }
-        }
-        
-        // Load calls when page loads
-        loadCalls();
-        
-        // Auto-refresh every 30 seconds
-        setInterval(loadCalls, 30000);
-    </script>
-</body>
-</html>`);
-});
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'healthy', 
-        timestamp: new Date().toISOString(),
-        port: process.env.PORT || 3000,
-        nodeVersion: process.version
-    });
-});
-
-// Database debug endpoint
-app.get('/api/debug/db', async (req, res) => {
-    try {
-        console.log('Database debug endpoint called');
-        
-        // Test basic database connection
-        const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
-        console.log('Total calls in DB:', totalCalls);
-        
-        // Get all calls with all columns
-        const allCalls = await dbAll('SELECT * FROM calls ORDER BY id DESC');
-        console.log('All calls in database:', allCalls);
-        
-        // Check table schema
-        const schema = await dbAll("PRAGMA table_info(calls)");
-        console.log('Calls table schema:', schema);
-        
-        res.json({
-            totalCalls: totalCalls.count,
-            calls: allCalls,
-            schema: schema,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        console.error('Database debug error:', error);
-        res.status(500).json({ 
-            error: error.message, 
-            stack: error.stack,
-            message: 'Database unavailable'
-        });
-    }
-});
-
-// Recordings endpoint - simple fallback
-app.get('/api/recordings', (req, res) => {
-    try {
-        res.json({
-            recordings: [],
-            count: 0,
-            source: 'disabled',
-            message: 'Memory storage disabled for stability',
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Configure human representative phone number
-app.post('/api/configure-human', async (req, res) => {
-    try {
-        const { phoneNumber } = req.body;
-        
-        if (!phoneNumber) {
-            return res.status(400).json({ error: 'Phone number is required' });
-        }
-        
-        // Validate phone number format (basic validation)
-        const phoneRegex = /^\+?1?[2-9]\d{2}[2-9]\d{2}\d{4}$/;
-        if (!phoneRegex.test(phoneNumber.replace(/\D/g, ''))) {
-            return res.status(400).json({ error: 'Invalid phone number format' });
-        }
-        
-        // In a production environment, you'd want to store this in database
-        // For now, we'll just confirm the environment variable should be set
-        console.log('Human representative phone number configured:', phoneNumber);
-        
-        res.json({ 
-            success: true, 
-            message: 'Human representative phone number configured successfully',
-            phoneNumber: phoneNumber,
-            note: 'Make sure to set HUMAN_PHONE_NUMBER environment variable to: ' + phoneNumber
-        });
-    } catch (error) {
-        console.error('Error configuring human phone number:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Get current human representative configuration
-app.get('/api/human-config', (req, res) => {
-    const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER;
-    
-    res.json({
-        configured: !!humanPhoneNumber && humanPhoneNumber !== '+1234567890',
-        phoneNumber: humanPhoneNumber === '+1234567890' ? null : humanPhoneNumber,
-        status: humanPhoneNumber === '+1234567890' ? 'not_configured' : 'configured'
-    });
-});
-
-// Initialize and start server
-async function startServer() {
-    try {
-        console.log('Starting server initialization...');
-        
-        // Initialize database first
-        await initDatabase();
-        
-        const PORT = process.env.PORT || 3000;
-        
-        const server = app.listen(PORT, '0.0.0.0', () => {
-            console.log(`Telnyx Lead Generation System running on port ${PORT}`);
-            console.log(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhooks/calls`);
-            console.log(`Telnyx phone number: ${process.env.TELNYX_PHONE_NUMBER || 'Not set'}`);
-            console.log(`Database path: ${dbPath}`);
-            console.log('Server is ready to receive calls!');
-        });
-
-        // Handle graceful shutdown
-        process.on('SIGTERM', () => {
-            console.log('SIGTERM received, closing database and server...');
-            db.close((err) => {
-                if (err) {
-                    console.error('Error closing database:', err);
-                } else {
-                    console.log('Database connection closed.');
-                }
-                server.close(() => {
-                    console.log('Server closed.');
-                    process.exit(0);
-                });
-            });
-        });
-
-        process.on('SIGINT', () => {
-            console.log('SIGINT received, closing database and server...');
-            db.close((err) => {
-                if (err) {
-                    console.error('Error closing database:', err);
-                } else {
-                    console.log('Database connection closed.');
-                }
-                server.close(() => {
-                    console.log('Server closed.');
-                    process.exit(0);
-                });
-            });
-        });
-        
-    } catch (error) {
-        console.error('Failed to start server:', error);
-        process.exit(1);
-    }
-}
-
-startServer().catch(console.error);
-
-export default app;
+                            \${(call.call_type === 'customer_inquiry' || call.call_type === 'human_connected') ? \`
+                                <div class="customer-info-section">
+                                    <div class="detail-label">Customer Information & Lead Quality</div>
+                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
+                                        <input type="text" class="info-input" placeholder="Customer Name" value="\${call.customer_name || ''}" id="name-\${call.call_id}">
+                                        <input type="text" class="info-input" placeholder="Zip Code" value="\${call.customer_zip_code || ''}" id="zip-\${call.call_id}">
+                                        <select class="info-input" id="quality-\${call.call_id}">
+                                            <option value="">Lead Quality</option>
+                                            <option value="hot" \${call.lead_quality === 'hot' ? 'selected' : ''}>Hot Lead</option>
+                                            <option value="warm" \${call.lead_quality === 'warm' ? 'selected' : ''}>Warm Lead</option>
+                                            <option value="cold" \${call.lead_quality === 'cold' ? 'selected' : ''}>Cold Lead</option>
+                                            <option value="not_interested" \${call.lead_quality === 'not_interested' ? 'selected' : ''}>Not Interested</option>
+                                        </select>
+                                        <textarea class="info-input" placeholder="Notes" id="notes-\${call.call_id}" rows="2">\${call.notes || ''}</textarea>
+                                    </div>
+                                    <button
