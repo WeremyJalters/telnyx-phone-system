@@ -17,13 +17,16 @@
     "cors": "^2.8.5",
     "helmet": "^7.0.0",
     "morgan": "^1.10.0",
-    "axios": "^1.5.0"
+    "axios": "^1.5.0",
+    "@aws-sdk/client-s3": "^3.583.0"
   },
   "keywords": [
     "telnyx",
     "lead-generation",
     "flood-restoration",
-    "phone-system"
+    "phone-system",
+    "digitalocean-spaces",
+    "s3"
   ],
   "author": "JW",
   "license": "MIT"
