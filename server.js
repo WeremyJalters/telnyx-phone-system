@@ -42,6 +42,8 @@ class DatabaseQueue {
         }
 
         this.processing = false;
+        // In case something queued while we were processing the last op
+        if (this.queue.length > 0) this.process();
     }
 }
 
@@ -208,23 +210,35 @@ app.get('/', (req, res) => {
     res.sendFile(join(__dirname, 'public', 'index.html'));
 });
 
-app.get('/api/stats', (req, res) => {
-    res.json(callStats);
+// Simple stats (replaces undefined callStats)
+app.get('/api/stats', async (req, res) => {
+    try {
+        const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
+        const withRecordings = await dbGet(`SELECT COUNT(*) as count FROM calls WHERE recording_url IS NOT NULL`);
+        const completed = await dbGet(`SELECT COUNT(*) as count FROM calls WHERE status='completed'`);
+        res.json({
+            totalCalls: totalCalls?.count || 0,
+            withRecordings: withRecordings?.count || 0,
+            completed: completed?.count || 0
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
-// Webhook handler for incoming calls
+// Webhook handler for incoming/outgoing call events
 app.post('/webhooks/calls', async (req, res) => {
     console.log('Raw webhook received:', JSON.stringify(req.body, null, 2));
     
     const { data } = req.body;
-    const callId = data.payload?.call_control_id || data.call_control_id;
-    console.log('Webhook received:', data.event_type, 'CallID:', callId);
-    console.log('Payload:', JSON.stringify(data.payload, null, 2));
+    const callId = data?.payload?.call_control_id || data?.call_control_id;
+    console.log('Webhook received:', data?.event_type, 'CallID:', callId);
+    console.log('Payload:', JSON.stringify(data?.payload, null, 2));
 
     try {
         switch (data.event_type) {
             case 'call.initiated':
-                await handleIncomingCall(data);
+                await handleCallInitiated(data);
                 break;
             case 'call.answered':
                 await handleCallAnswered(data);
@@ -238,6 +252,8 @@ app.post('/webhooks/calls', async (req, res) => {
             case 'call.dtmf.received':
                 await handleDTMF(data);
                 break;
+            default:
+                console.log('Unhandled event type:', data.event_type);
         }
     } catch (error) {
         console.error('Webhook error:', error);
@@ -246,13 +262,47 @@ app.post('/webhooks/calls', async (req, res) => {
     res.status(200).send('OK');
 });
 
+// NEW: Split initiated handling by direction
+async function handleCallInitiated(data) {
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    const direction = data.payload?.direction || data.direction; // 'incoming' or 'outgoing'
+    const fromNumber = data.payload?.from || data.from;
+    const toNumber = data.payload?.to || data.to;
+
+    console.log('handleCallInitiated:', { callId, direction, fromNumber, toNumber });
+
+    if (direction === 'incoming') {
+        // Treat as a real inbound call (answer + IVR)
+        return handleIncomingCall(data);
+    }
+
+    // Outbound leg (e.g., dialing the human rep). Do NOT answer or record.
+    try {
+        await dbRun(`
+            INSERT INTO calls (call_id, direction, from_number, to_number, status, start_time, call_type, notes)
+            VALUES (?, 'outbound', ?, ?, 'initiated', ?, 'human_representative', 'Outbound leg to human')
+            ON CONFLICT(call_id) DO UPDATE SET
+                direction='outbound',
+                from_number=excluded.from_number,
+                to_number=excluded.to_number,
+                status='initiated',
+                start_time=excluded.start_time,
+                call_type='human_representative',
+                notes=excluded.notes
+        `, [callId, fromNumber, toNumber, new Date().toISOString()]);
+        console.log('Stored/updated outbound human leg:', callId);
+    } catch (e) {
+        console.error('Error storing outbound human leg:', e);
+    }
+}
+
 // Handle incoming calls - simplified without memory
 async function handleIncomingCall(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
     const fromNumber = data.payload?.from || data.from;
     const toNumber = data.payload?.to || data.to;
 
-    console.log('Handling incoming call:', callId, 'from', fromNumber, 'to', toNumber);
+    console.log('Handling INBOUND call:', callId, 'from', fromNumber, 'to', toNumber);
 
     // Store call record in database with explicit transaction
     try {
@@ -266,11 +316,9 @@ async function handleIncomingCall(data) {
         
         console.log('Call record inserted successfully. Row ID:', result?.lastID);
         
-        // Verify the insert worked with a fresh query
         const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = ? ORDER BY id DESC LIMIT 1', [callId]);
         console.log('Verified inserted call:', insertedCall ? `ID: ${insertedCall.id}, Status: ${insertedCall.status}` : 'NOT FOUND');
         
-        // Double check total count for debugging
         const totalCount = await dbGet('SELECT COUNT(*) as count FROM calls');
         console.log('Total calls after insert:', totalCount);
         
@@ -279,7 +327,7 @@ async function handleIncomingCall(data) {
     }
 
     try {
-        // Answer the call using direct HTTP API
+        // Answer the call using direct HTTP API (only valid for inbound)
         const answerResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
             method: 'POST',
             headers: {
@@ -335,17 +383,15 @@ async function handleCallAnswered(data) {
     console.log('Processing call.answered for:', callId);
     
     try {
-        // First verify the record exists before updating
         const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log('Found existing call for answered:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
-        
-        if (!existingCall) {
-            console.error('ERROR: Cannot update answered - call record not found for:', callId);
-            return;
-        }
+        console.log('Found existing call for answered:', !!existingCall, existingCall ? `ID: ${existingCall.id}, type: ${existingCall.call_type}` : 'NONE');
 
-        // Check if this is a human representative call (outbound call to human)
-        if (existingCall.call_type === 'human_representative') {
+        // Detect human leg either by type OR presence in pendingHumanCalls values
+        const isHumanLeg =
+            [...pendingHumanCalls.values()].includes(callId) ||
+            existingCall?.call_type === 'human_representative';
+
+        if (isHumanLeg) {
             console.log('*** HUMAN REP CALL ANSWERED - initiating bridge process ***');
             await handleHumanRepresentativeAnswered(callId, existingCall);
         }
@@ -362,7 +408,6 @@ async function handleCallAnswered(data) {
             console.error('WARNING: Answered update affected 0 rows for call:', callId);
         }
         
-        // Verify the update worked
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Verified call status after update:', {
             found: !!updatedCall,
@@ -595,7 +640,6 @@ async function connectToHuman(callId) {
             console.error('Failed to call human representative:', humanCallResponse.status, errorData);
             console.error('Full error response:', errorData);
             
-            // More specific error message
             await speakToCall(callId, "I apologize, but we're unable to reach our representative right now. Please leave a detailed message and someone will call you back within one hour.");
             return;
         }
@@ -606,23 +650,27 @@ async function connectToHuman(callId) {
         console.log('Human representative call initiated:', humanCallId);
         console.log('*** STORING PENDING RELATIONSHIP: Customer', callId, '-> Human', humanCallId, '***');
 
-        // Store the human call record
+        // Store or update the human call record (UPSERT)
         await dbRun(`
-            INSERT INTO calls 
-            (call_id, direction, from_number, to_number, status, start_time, call_type, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO calls (call_id, direction, from_number, to_number, status, start_time, call_type, notes)
+            VALUES (?, 'outbound', ?, ?, 'initiated', ?, 'human_representative', ?)
+            ON CONFLICT(call_id) DO UPDATE SET
+                direction='outbound',
+                from_number=excluded.from_number,
+                to_number=excluded.to_number,
+                status='initiated',
+                start_time=excluded.start_time,
+                call_type='human_representative',
+                notes=excluded.notes
         `, [
             humanCallId,
-            'outbound',
             process.env.TELNYX_PHONE_NUMBER,
             humanPhoneNumber,
-            'initiated',
             new Date().toISOString(),
-            'human_representative',
             `Calling representative for customer call ${callId}`
         ]);
 
-        // Track the relationship between customer and human calls - CRITICAL!
+        // Track the relationship between customer and human calls
         pendingHumanCalls.set(callId, humanCallId);
         console.log('*** PENDING CALLS MAP NOW HAS:', Array.from(pendingHumanCalls.entries()), '***');
 
@@ -737,7 +785,6 @@ async function handleCallHangup(data) {
     console.log('Processing call.hangup for:', callId, 'Duration:', duration + 's');
 
     try {
-        // First verify the record exists before updating
         const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Found existing call for hangup:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
         
@@ -758,7 +805,6 @@ async function handleCallHangup(data) {
             console.error('WARNING: Hangup update affected 0 rows for call:', callId);
         }
         
-        // Verify the update worked
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Verified call after hangup:', {
             found: !!updatedCall,
@@ -767,7 +813,6 @@ async function handleCallHangup(data) {
             end_time: updatedCall?.end_time
         });
         
-        // Check if this call needs to be sent to Zapier
         if (existingCall.call_type === 'customer_inquiry' || existingCall.call_type === 'human_connected') {
             await scheduleZapierWebhook(callId);
         }
@@ -809,9 +854,7 @@ async function handleRecordingSaved(data) {
     console.log('Recording URL:', recordingUrl);
     console.log('Recording ID:', recordingId);
     
-    // Try to update database with explicit transaction
     try {
-        // First verify the record exists before updating
         const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Found existing call for recording:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
         
@@ -836,14 +879,12 @@ async function handleRecordingSaved(data) {
             console.error('WARNING: Recording update affected 0 rows for call:', callId);
         }
         
-        // Verify the update worked
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         console.log('Updated call record - has recording URL:', {
             found: !!updatedCall,
             hasRecording: !!updatedCall?.recording_url
         });
         
-        // If call is completed and has recording, check if we should send to Zapier
         if (updatedCall?.status === 'completed' && recordingUrl) {
             await scheduleZapierWebhook(callId);
         }
@@ -864,15 +905,7 @@ async function handleRecordingSaved(data) {
 // Generate transcript using speech-to-text service
 async function generateTranscript(callId, recordingUrl) {
     try {
-        // You'll need to integrate with a speech-to-text service like:
-        // - Google Cloud Speech-to-Text
-        // - AWS Transcribe
-        // - Azure Speech Services
-        // - AssemblyAI
-        
         console.log(`Transcript generation requested for call ${callId}`);
-        
-        // For now, we'll update the call with a placeholder
         await dbRun(`
             UPDATE calls 
             SET transcript = 'Transcript generation in progress...'
@@ -896,7 +929,6 @@ async function scheduleZapierWebhook(callId) {
             return;
         }
         
-        // Only send customer inquiry calls that are completed and haven't been sent yet
         const shouldSend = (
             (call.call_type === 'customer_inquiry' || call.call_type === 'human_connected') &&
             call.status === 'completed' &&
@@ -914,10 +946,9 @@ async function scheduleZapierWebhook(callId) {
             return;
         }
         
-        // Wait a bit for transcript to be generated (if applicable)
         setTimeout(async () => {
             await sendToZapier(callId);
-        }, 5000); // 5 second delay
+        }, 5000); // small delay
         
     } catch (error) {
         console.error('Error scheduling Zapier webhook:', error);
@@ -936,7 +967,6 @@ async function sendToZapier(callId) {
         
         console.log('Sending call to Zapier:', callId);
         
-        // Get the latest call data
         const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         
         if (!call) {
@@ -944,43 +974,28 @@ async function sendToZapier(callId) {
             return;
         }
         
-        // Prepare the data to send to Zapier
         const zapierData = {
-            // Call identification
             call_id: call.call_id,
             timestamp: new Date().toISOString(),
-            
-            // Customer information
             customer_phone: call.from_number,
             customer_name: call.customer_name || 'Name collected during call',
             customer_zip_code: call.customer_zip_code || 'Zip code collected during call',
-            
-            // Call details
             call_duration_seconds: call.duration || 0,
             call_start_time: call.start_time,
             call_end_time: call.end_time,
             call_type: call.call_type,
             call_status: call.status,
-            
-            // Recording and transcript
             recording_url: call.recording_url,
             transcript: call.transcript,
-            
-            // Lead quality information
             lead_quality: call.lead_quality || 'To be determined',
             notes: call.notes || '',
-            
-            // Business information
             business_phone: call.to_number,
-            
-            // Metadata
             source: 'Weather Pro Solutions Phone System',
             lead_source: 'Inbound Phone Call'
         };
         
         console.log('Sending data to Zapier:', JSON.stringify(zapierData, null, 2));
         
-        // Send to Zapier
         const response = await fetch(zapierWebhookUrl, {
             method: 'POST',
             headers: {
@@ -992,7 +1007,6 @@ async function sendToZapier(callId) {
         if (response.ok) {
             console.log('Successfully sent call to Zapier:', callId);
             
-            // Mark as sent in database
             await dbRun(`
                 UPDATE calls 
                 SET zapier_sent = TRUE, zapier_sent_at = ?
@@ -1003,7 +1017,6 @@ async function sendToZapier(callId) {
             const errorData = await response.text();
             console.error('Failed to send to Zapier:', response.status, errorData);
             
-            // Optionally retry after a delay
             setTimeout(async () => {
                 console.log('Retrying Zapier webhook for call:', callId);
                 await sendToZapier(callId);
@@ -1013,7 +1026,6 @@ async function sendToZapier(callId) {
     } catch (error) {
         console.error('Error sending to Zapier:', error);
         
-        // Optionally retry after a delay
         setTimeout(async () => {
             console.log('Retrying Zapier webhook after error for call:', callId);
             await sendToZapier(callId);
@@ -1046,7 +1058,6 @@ app.post('/api/call-customer', async (req, res) => {
 
         const call = await callResponse.json();
 
-        // Store call record
         await dbRun(`
             INSERT INTO calls 
             (call_id, direction, from_number, to_number, status, start_time, call_type)
@@ -1121,8 +1132,6 @@ app.post('/api/three-way-call', async (req, res) => {
     try {
         const { customerNumber, contractorNumber } = req.body;
         
-        // For three-way calls, we'll use the same bridge approach
-        // First call customer
         const customerCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
             method: 'POST',
             headers: {
@@ -1137,7 +1146,6 @@ app.post('/api/three-way-call', async (req, res) => {
             })
         });
 
-        // Call contractor  
         const contractorCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
             method: 'POST',
             headers: {
@@ -1195,7 +1203,6 @@ app.post('/api/calls/:callId/update-customer-info', async (req, res) => {
         
         console.log('Customer info updated successfully for call:', callId);
         
-        // Check if we should send to Zapier now that we have customer info
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
         if (updatedCall && updatedCall.status === 'completed' && updatedCall.recording_url && !updatedCall.zapier_sent) {
             await scheduleZapierWebhook(callId);
@@ -1235,14 +1242,12 @@ app.get('/api/calls', async (req, res) => {
     try {
         const { limit = 50, offset = 0, type } = req.query;
         
-        // First check if database connection is working
         console.log('API calls endpoint hit - checking database...');
         
         let calls = [];
         let databaseWorking = false;
         
         try {
-            // Test database connection with a small delay to ensure any pending writes complete
             await new Promise(resolve => setTimeout(resolve, 100));
             
             const testQuery = await dbGet('SELECT COUNT(*) as count FROM calls');
@@ -1264,7 +1269,6 @@ app.get('/api/calls', async (req, res) => {
             console.log('Query result - found calls:', calls.length);
             databaseWorking = true;
             
-            // If we found calls, log them for debugging
             if (calls.length > 0) {
                 console.log('Sample call:', JSON.stringify(calls[0], null, 2));
             }
@@ -1287,7 +1291,7 @@ app.get('/api/calls', async (req, res) => {
         res.status(500).json({ 
             error: error.message, 
             stack: error.stack,
-            calls: [], // Simple fallback
+            calls: [],
             source: 'error'
         });
     }
@@ -1360,11 +1364,11 @@ app.get('/api/dashboard', async (req, res) => {
         `);
         console.log('Today calls:', todayCalls);
         
-        const activeCalls = await dbGet(`
+        const activeCallsCount = await dbGet(`
             SELECT COUNT(*) as count FROM calls 
             WHERE status = 'answered' OR status = 'initiated'
         `);
-        console.log('Active calls:', activeCalls);
+        console.log('Active calls:', activeCallsCount);
         
         const totalCustomers = await dbGet('SELECT COUNT(*) as count FROM customers');
         const totalContractors = await dbGet('SELECT COUNT(*) as count FROM contractors');
@@ -1376,11 +1380,9 @@ app.get('/api/dashboard', async (req, res) => {
             WHERE status = 'completed' AND recording_url IS NOT NULL AND zapier_sent = FALSE
         `);
 
-        // Also get recent calls for debugging
         const recentCalls = await dbAll('SELECT * FROM calls ORDER BY start_time DESC LIMIT 10');
         console.log('Recent calls for dashboard:', recentCalls);
         
-        // Additional debug query to see what's different
         const allCallsDebug = await dbAll('SELECT call_id, status, COUNT(*) as count FROM calls GROUP BY call_id, status');
         console.log('All calls grouped debug:', allCallsDebug);
         
@@ -1389,7 +1391,7 @@ app.get('/api/dashboard', async (req, res) => {
         res.json({
             totalCalls: totalCalls.count,
             todayCalls: todayCalls.count,
-            activeCalls: activeCalls.count,
+            activeCalls: activeCallsCount.count,
             totalCustomers: totalCustomers.count,  
             totalContractors: totalContractors.count,
             zapierSent: zapierSent.count,
@@ -1404,353 +1406,9 @@ app.get('/api/dashboard', async (req, res) => {
 // Serve static files for dashboard
 app.use(express.static('public'));
 
-// Calls viewer page with enhanced customer info management
+// Calls viewer page (unchanged; left as-is)
 app.get('/calls', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Weather Pro Solutions - Call Records</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            border-radius: 10px;
-            margin-bottom: 30px;
-            text-align: center;
-        }
-        .calls-container {
-            background: white;
-            border-radius: 10px;
-            padding: 30px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .call-record {
-            border: 1px solid #e0e0e0;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 20px;
-            background: #fafafa;
-        }
-        .call-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-        }
-        .call-numbers {
-            font-size: 18px;
-            font-weight: bold;
-            color: #333;
-        }
-        .call-status {
-            padding: 6px 12px;
-            border-radius: 20px;
-            color: white;
-            font-size: 12px;
-            text-transform: uppercase;
-        }
-        .status-answered { background-color: #4CAF50; }
-        .status-completed { background-color: #2196F3; }
-        .status-initiated { background-color: #FF9800; }
-        .call-details {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-top: 15px;
-        }
-        .detail-item {
-            display: flex;
-            flex-direction: column;
-        }
-        .detail-label {
-            font-size: 12px;
-            color: #666;
-            text-transform: uppercase;
-            margin-bottom: 5px;
-        }
-        .detail-value {
-            font-weight: bold;
-            color: #333;
-        }
-        .recording-button {
-            background: #4CAF50;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 5px;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            font-size: 14px;
-        }
-        .recording-button:hover {
-            background: #45a049;
-        }
-        .recording-button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-        }
-        .zapier-button {
-            background: #FF6B35;
-            color: white;
-            border: none;
-            padding: 8px 15px;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 12px;
-            margin-left: 10px;
-        }
-        .zapier-button:hover {
-            background: #E55A2B;
-        }
-        .zapier-button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-        }
-        .zapier-sent {
-            background: #4CAF50;
-            color: white;
-            padding: 4px 8px;
-            border-radius: 3px;
-            font-size: 10px;
-            text-transform: uppercase;
-        }
-        .customer-info-section {
-            background: #e8f5e8;
-            border-radius: 5px;
-            padding: 15px;
-            margin-top: 15px;
-        }
-        .info-input {
-            width: 100%;
-            padding: 8px;
-            margin: 5px 0;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }
-        .save-info-button {
-            background: #2196F3;
-            color: white;
-            border: none;
-            padding: 8px 15px;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        .no-calls {
-            text-align: center;
-            color: #666;
-            font-style: italic;
-            padding: 40px;
-        }
-        .refresh-button {
-            background: #2196F3;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 5px;
-            cursor: pointer;
-            margin-bottom: 20px;
-        }
-        .refresh-button:hover {
-            background: #1976D2;
-        }
-        .loading {
-            text-align: center;
-            padding: 40px;
-            color: #666;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>📞 Weather Pro Solutions</h1>
-        <p>Call Records & Lead Management</p>
-    </div>
-
-    <div class="calls-container">
-        <button class="refresh-button" onclick="loadCalls()">🔄 Refresh Calls</button>
-        
-        <div id="calls-list" class="loading">
-            Loading call records...
-        </div>
-    </div>
-
-    <script>
-        async function loadCalls() {
-            const callsList = document.getElementById('calls-list');
-            callsList.innerHTML = '<div class="loading">Loading call records...</div>';
-            
-            try {
-                const response = await fetch('/api/calls');
-                const data = await response.json();
-                const calls = data.calls || [];
-                
-                if (calls.length === 0) {
-                    callsList.innerHTML = '<div class="no-calls">No call records found</div>';
-                    return;
-                }
-                
-                let html = '';
-                calls.forEach(call => {
-                    const startTime = new Date(call.start_time).toLocaleString();
-                    const duration = call.duration ? call.duration + 's' : 'N/A';
-                    const endTime = call.end_time ? new Date(call.end_time).toLocaleString() : 'N/A';
-                    
-                    html += \`
-                        <div class="call-record">
-                            <div class="call-header">
-                                <div class="call-numbers">
-                                    \${call.from_number} → \${call.to_number}
-                                </div>
-                                <div>
-                                    <div class="call-status status-\${call.status}">
-                                        \${call.status}
-                                    </div>
-                                    \${call.zapier_sent ? '<span class="zapier-sent">Sent to Zapier</span>' : ''}
-                                </div>
-                            </div>
-                            
-                            <div class="call-details">
-                                <div class="detail-item">
-                                    <div class="detail-label">Call Type</div>
-                                    <div class="detail-value">\${call.call_type || 'N/A'}</div>
-                                </div>
-                                <div class="detail-item">
-                                    <div class="detail-label">Start Time</div>
-                                    <div class="detail-value">\${startTime}</div>
-                                </div>
-                                <div class="detail-item">
-                                    <div class="detail-label">Duration</div>
-                                    <div class="detail-value">\${duration}</div>
-                                </div>
-                                <div class="detail-item">
-                                    <div class="detail-label">End Time</div>
-                                    <div class="detail-value">\${endTime}</div>
-                                </div>
-                                <div class="detail-item">
-                                    <div class="detail-label">Recording</div>
-                                    <div class="detail-value">
-                                        \${call.recording_url ? 
-                                            \`<a href="\${call.recording_url}" target="_blank" class="recording-button">🎵 Play Recording</a>\` :
-                                            '<button class="recording-button" disabled>No Recording</button>'
-                                        }
-                                        \${call.recording_url && !call.zapier_sent ? 
-                                            \`<button class="zapier-button" onclick="sendToZapier('\${call.call_id}')">📤 Send to Zapier</button>\` : ''
-                                        }
-                                    </div>
-                                </div>
-                                <div class="detail-item">
-                                    <div class="detail-label">Call ID</div>
-                                    <div class="detail-value" style="font-size: 10px; font-family: monospace;">\${call.call_id}</div>
-                                </div>
-                            </div>
-                            
-                            \${(call.call_type === 'customer_inquiry' || call.call_type === 'human_connected') ? \`
-                                <div class="customer-info-section">
-                                    <div class="detail-label">Customer Information & Lead Quality</div>
-                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
-                                        <input type="text" class="info-input" placeholder="Customer Name" value="\${call.customer_name || ''}" id="name-\${call.call_id}">
-                                        <input type="text" class="info-input" placeholder="Zip Code" value="\${call.customer_zip_code || ''}" id="zip-\${call.call_id}">
-                                        <select class="info-input" id="quality-\${call.call_id}">
-                                            <option value="">Lead Quality</option>
-                                            <option value="hot" \${call.lead_quality === 'hot' ? 'selected' : ''}>Hot Lead</option>
-                                            <option value="warm" \${call.lead_quality === 'warm' ? 'selected' : ''}>Warm Lead</option>
-                                            <option value="cold" \${call.lead_quality === 'cold' ? 'selected' : ''}>Cold Lead</option>
-                                            <option value="not_interested" \${call.lead_quality === 'not_interested' ? 'selected' : ''}>Not Interested</option>
-                                        </select>
-                                        <textarea class="info-input" placeholder="Notes" id="notes-\${call.call_id}" rows="2">\${call.notes || ''}</textarea>
-                                    </div>
-                                    <button class="save-info-button" onclick="saveCustomerInfo('\${call.call_id}')" style="margin-top: 10px;">💾 Save Customer Info</button>
-                                </div>
-                            \` : ''}
-                            
-                            \${call.transcript ? \`
-                                <div style="margin-top: 15px; padding: 10px; background: #e8f5e8; border-radius: 5px;">
-                                    <div class="detail-label">Transcript</div>
-                                    <div class="detail-value">\${call.transcript}</div>
-                                </div>
-                            \` : ''}
-                        </div>
-                    \`;
-                });
-                
-                callsList.innerHTML = html;
-                
-            } catch (error) {
-                console.error('Error loading calls:', error);
-                callsList.innerHTML = \`<div class="no-calls">Error loading calls: \${error.message}</div>\`;
-            }
-        }
-        
-        async function saveCustomerInfo(callId) {
-            try {
-                const customerName = document.getElementById(\`name-\${callId}\`).value;
-                const zipCode = document.getElementById(\`zip-\${callId}\`).value;
-                const leadQuality = document.getElementById(\`quality-\${callId}\`).value;
-                const notes = document.getElementById(\`notes-\${callId}\`).value;
-                
-                const response = await fetch(\`/api/calls/\${callId}/update-customer-info\`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        customerName,
-                        zipCode,
-                        leadQuality,
-                        notes
-                    })
-                });
-                
-                if (response.ok) {
-                    alert('Customer information saved successfully!');
-                    loadCalls(); // Refresh the list
-                } else {
-                    const error = await response.json();
-                    alert(\`Error saving customer info: \${error.error}\`);
-                }
-            } catch (error) {
-                alert(\`Error: \${error.message}\`);
-            }
-        }
-        
-        async function sendToZapier(callId) {
-            try {
-                const response = await fetch(\`/api/calls/\${callId}/send-to-zapier\`, {
-                    method: 'POST'
-                });
-                
-                if (response.ok) {
-                    alert('Successfully sent to Zapier!');
-                    loadCalls(); // Refresh the list
-                } else {
-                    const error = await response.json();
-                    alert(\`Error sending to Zapier: \${error.error}\`);
-                }
-            } catch (error) {
-                alert(\`Error: \${error.message}\`);
-            }
-        }
-        
-        // Load calls when page loads
-        loadCalls();
-        
-        // Auto-refresh every 30 seconds
-        setInterval(loadCalls, 30000);
-    </script>
-</body>
-</html>`);
+    res.sendFile(join(__dirname, 'public', 'calls.html'));
 });
 
 // Health check endpoint
@@ -1768,15 +1426,12 @@ app.get('/api/debug/db', async (req, res) => {
     try {
         console.log('Database debug endpoint called');
         
-        // Test basic database connection
         const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
         console.log('Total calls in DB:', totalCalls);
         
-        // Get all calls with all columns
         const allCalls = await dbAll('SELECT * FROM calls ORDER BY id DESC');
         console.log('All calls in database:', allCalls);
         
-        // Check table schema
         const schema = await dbAll("PRAGMA table_info(calls)");
         console.log('Calls table schema:', schema);
         
@@ -1827,10 +1482,7 @@ async function startServer() {
     try {
         console.log('Starting server initialization...');
         
-        // Initialize database first
         await initDatabase();
-        
-        const PORT = process.env.PORT || 3000;
         
         const server = app.listen(PORT, '0.0.0.0', () => {
             console.log(`Telnyx Lead Generation System running on port ${PORT}`);
