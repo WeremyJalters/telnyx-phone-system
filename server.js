@@ -193,6 +193,13 @@ app.post('/webhooks/calls', async (req, res) => {
       case 'call.recording.saved': await handleRecordingSaved(data); break;
       case 'call.dtmf.received': await handleDTMF(data); break;
       case 'call.bridged': console.log('Telnyx confirms bridge for:', callId); break;
+
+      // noise we don’t care about (keep logs clean)
+      case 'call.speak.started':
+      case 'call.speak.ended':
+      case 'call.gather.ended':
+        break;
+
       default: console.log('Unhandled event:', event);
     }
   } catch (e) { console.error('Webhook error:', e); }
@@ -316,6 +323,7 @@ async function handleRecordingSaved(data) {
     try { await dbRun('ROLLBACK'); } catch {}
   }
 
+  // Placeholder transcript (you can integrate later)
   await upsertFields(call_id, { transcript: 'Transcript generation in progress...' });
 
   const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
@@ -335,10 +343,10 @@ async function handleDTMF(data) {
         await connectToHuman(callId);
         break;
       case '2':
-        await gatherUsingSpeak(
+        // No gather here — call is already recording. Just prompt and let them talk then hang up.
+        await speakToCall(
           callId,
-          "Please describe your water or flood damage situation after the beep. Include your address and details of the damage. Press pound when finished.",
-          { min: 0, max: 0, timeoutMs: 30000, term: '#' }
+          "Please describe your water or flood damage situation after the beep. Include your address and details of the damage. When you're done, you can simply hang up."
         );
         break;
       default:
@@ -369,6 +377,7 @@ async function answerAndIntro(callId) {
     });
     if (!answer.ok) { console.error('Failed to answer:', await answer.text()); return; }
 
+    // Start full-call recording
     await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
       method: 'POST', headers: telnyxHeaders(),
       body: JSON.stringify({ format: 'mp3', channels: 'dual' })
@@ -431,7 +440,12 @@ async function gatherUsingAudio(callId, audioUrl, { min = 1, max = 1, timeoutMs 
 
 async function connectToHuman(customerCallId) {
   try {
-    const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER || '+18609389491';
+    const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER || '';
+
+    if (!humanPhoneNumber) {
+      await speakToCall(customerCallId, "Sorry, we can't reach a representative right now. Please leave a message after the beep and we'll call you back.");
+      return;
+    }
 
     await upsertFields(customerCallId, { call_type: 'human_transfer', notes: 'Customer transferred to human representative' });
 
@@ -513,9 +527,11 @@ async function handleHumanRepresentativeAnswered(humanCallId) {
 }
 
 async function handleHumanNoAnswer(callId) {
-  await speakToCall(callId, "I’m sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep. Press pound when you’re finished.");
-  await waitMs(800);
-  await gatherUsingSpeak(callId, "Please leave your message now. Press pound when finished.", { min: 0, max: 0, timeoutMs: 60000, term: '#' });
+  // No gather—call is recording
+  await speakToCall(
+    callId,
+    "I’m sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep. When you're done, you can hang up."
+  );
 }
 
 // ------------------------------------------------------
@@ -554,7 +570,7 @@ async function sendToZapier(callId) {
       call_end_time: call.end_time,
       call_type: call.call_type,
       call_status: call.status,
-      recording_url: call.recording_url, // now permanent Spaces CDN link
+      recording_url: call.recording_url, // permanent Spaces CDN link
       transcript: call.transcript,
       lead_quality: call.lead_quality || 'To be determined',
       notes: call.notes || '',
