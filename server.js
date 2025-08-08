@@ -1659,4 +1659,213 @@ app.get('/calls', (req, res) => {
                                         </select>
                                         <textarea class="info-input" placeholder="Notes" id="notes-\${call.call_id}" rows="2">\${call.notes || ''}</textarea>
                                     </div>
-                                    <button
+                                    <button class="save-info-button" onclick="saveCustomerInfo('\${call.call_id}')" style="margin-top: 10px;">💾 Save Customer Info</button>
+                                </div>
+                            \` : ''}
+                            
+                            \${call.transcript ? \`
+                                <div style="margin-top: 15px; padding: 10px; background: #e8f5e8; border-radius: 5px;">
+                                    <div class="detail-label">Transcript</div>
+                                    <div class="detail-value">\${call.transcript}</div>
+                                </div>
+                            \` : ''}
+                        </div>
+                    \`;
+                });
+                
+                callsList.innerHTML = html;
+                
+            } catch (error) {
+                console.error('Error loading calls:', error);
+                callsList.innerHTML = \`<div class="no-calls">Error loading calls: \${error.message}</div>\`;
+            }
+        }
+        
+        async function saveCustomerInfo(callId) {
+            try {
+                const customerName = document.getElementById(\`name-\${callId}\`).value;
+                const zipCode = document.getElementById(\`zip-\${callId}\`).value;
+                const leadQuality = document.getElementById(\`quality-\${callId}\`).value;
+                const notes = document.getElementById(\`notes-\${callId}\`).value;
+                
+                const response = await fetch(\`/api/calls/\${callId}/update-customer-info\`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        customerName,
+                        zipCode,
+                        leadQuality,
+                        notes
+                    })
+                });
+                
+                if (response.ok) {
+                    alert('Customer information saved successfully!');
+                    loadCalls(); // Refresh the list
+                } else {
+                    const error = await response.json();
+                    alert(\`Error saving customer info: \${error.error}\`);
+                }
+            } catch (error) {
+                alert(\`Error: \${error.message}\`);
+            }
+        }
+        
+        async function sendToZapier(callId) {
+            try {
+                const response = await fetch(\`/api/calls/\${callId}/send-to-zapier\`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    alert('Successfully sent to Zapier!');
+                    loadCalls(); // Refresh the list
+                } else {
+                    const error = await response.json();
+                    alert(\`Error sending to Zapier: \${error.error}\`);
+                }
+            } catch (error) {
+                alert(\`Error: \${error.message}\`);
+            }
+        }
+        
+        // Load calls when page loads
+        loadCalls();
+        
+        // Auto-refresh every 30 seconds
+        setInterval(loadCalls, 30000);
+    </script>
+</body>
+</html>`);
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'healthy', 
+        timestamp: new Date().toISOString(),
+        port: process.env.PORT || 3000,
+        nodeVersion: process.version
+    });
+});
+
+// Database debug endpoint
+app.get('/api/debug/db', async (req, res) => {
+    try {
+        console.log('Database debug endpoint called');
+        
+        // Test basic database connection
+        const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
+        console.log('Total calls in DB:', totalCalls);
+        
+        // Get all calls with all columns
+        const allCalls = await dbAll('SELECT * FROM calls ORDER BY id DESC');
+        console.log('All calls in database:', allCalls);
+        
+        // Check table schema
+        const schema = await dbAll("PRAGMA table_info(calls)");
+        console.log('Calls table schema:', schema);
+        
+        res.json({
+            totalCalls: totalCalls.count,
+            calls: allCalls,
+            schema: schema,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('Database debug error:', error);
+        res.status(500).json({ 
+            error: error.message, 
+            stack: error.stack,
+            message: 'Database unavailable'
+        });
+    }
+});
+
+// Recordings endpoint - simple fallback
+app.get('/api/recordings', (req, res) => {
+    try {
+        res.json({
+            recordings: [],
+            count: 0,
+            source: 'disabled',
+            message: 'Memory storage disabled for stability',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get current human representative configuration
+app.get('/api/human-config', (req, res) => {
+    const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER;
+    
+    res.json({
+        configured: !!humanPhoneNumber && humanPhoneNumber !== '+1234567890',
+        phoneNumber: humanPhoneNumber === '+1234567890' ? null : humanPhoneNumber,
+        status: humanPhoneNumber === '+1234567890' ? 'not_configured' : 'configured'
+    });
+});
+
+// Initialize and start server
+async function startServer() {
+    try {
+        console.log('Starting server initialization...');
+        
+        // Initialize database first
+        await initDatabase();
+        
+        const PORT = process.env.PORT || 3000;
+        
+        const server = app.listen(PORT, '0.0.0.0', () => {
+            console.log(`Telnyx Lead Generation System running on port ${PORT}`);
+            console.log(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhooks/calls`);
+            console.log(`Telnyx phone number: ${process.env.TELNYX_PHONE_NUMBER || 'Not set'}`);
+            console.log(`Human phone number: ${process.env.HUMAN_PHONE_NUMBER || 'Not set'}`);
+            console.log(`Database path: ${dbPath}`);
+            console.log('Server is ready to receive calls!');
+        });
+
+        // Handle graceful shutdown
+        process.on('SIGTERM', () => {
+            console.log('SIGTERM received, closing database and server...');
+            db.close((err) => {
+                if (err) {
+                    console.error('Error closing database:', err);
+                } else {
+                    console.log('Database connection closed.');
+                }
+                server.close(() => {
+                    console.log('Server closed.');
+                    process.exit(0);
+                });
+            });
+        });
+
+        process.on('SIGINT', () => {
+            console.log('SIGINT received, closing database and server...');
+            db.close((err) => {
+                if (err) {
+                    console.error('Error closing database:', err);
+                } else {
+                    console.log('Database connection closed.');
+                }
+                server.close(() => {
+                    console.log('Server closed.');
+                    process.exit(0);
+                });
+            });
+        });
+        
+    } catch (error) {
+        console.error('Failed to start server:', error);
+        process.exit(1);
+    }
+}
+
+startServer().catch(console.error);
+
+export default app;
