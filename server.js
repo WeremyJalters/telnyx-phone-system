@@ -3,7 +3,6 @@ import bodyParser from 'body-parser';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import sqlite3 from 'sqlite3';
-import { promisify } from 'util';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -11,29 +10,16 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Enhanced Database operation queue with better consistency
+// Database operation queue to ensure single-threaded access
 class DatabaseQueue {
     constructor() {
         this.queue = [];
         this.processing = false;
-        this.operationCount = 0;
     }
 
-    async execute(operation, operationName = 'unknown') {
+    async execute(operation) {
         return new Promise((resolve, reject) => {
-            const operationId = ++this.operationCount;
-            const timestamp = new Date().toISOString();
-            
-            console.log(`[telnyx-phone-system] [${timestamp}] Queueing DB operation #${operationId}: ${operationName}`);
-            
-            this.queue.push({ 
-                operation, 
-                resolve, 
-                reject, 
-                operationName,
-                operationId,
-                timestamp
-            });
+            this.queue.push({ operation, resolve, reject });
             this.process();
         });
     }
@@ -46,14 +32,11 @@ class DatabaseQueue {
         this.processing = true;
 
         while (this.queue.length > 0) {
-            const { operation, resolve, reject, operationName, operationId, timestamp } = this.queue.shift();
+            const { operation, resolve, reject } = this.queue.shift();
             try {
-                console.log(`[telnyx-phone-system] [${timestamp}] Executing DB operation #${operationId}: ${operationName}`);
                 const result = await operation();
-                console.log(`[telnyx-phone-system] [${timestamp}] DB operation #${operationId} SUCCESS: ${operationName}`);
                 resolve(result);
             } catch (error) {
-                console.error(`[telnyx-phone-system] [${timestamp}] DB operation #${operationId} ERROR: ${operationName}`, error);
                 reject(error);
             }
         }
@@ -66,79 +49,76 @@ const dbQueue = new DatabaseQueue();
 
 // Force single database instance with absolute path and better connection management
 const dbPath = process.env.DATABASE_PATH || join(__dirname, 'call_records.db');
-console.log('[telnyx-phone-system] Database path:', dbPath);
+console.log('Database path:', dbPath);
 
-// Create database with more explicit settings for consistency
+// Create database with more explicit settings
 const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
     if (err) {
-        console.error('[telnyx-phone-system] Error opening database:', err);
+        console.error('Error opening database:', err);
     } else {
-        console.log('[telnyx-phone-system] Connected to SQLite database at:', dbPath);
+        console.log('Connected to SQLite database at:', dbPath);
     }
 });
 
-// Enable WAL mode and configure for consistency - run synchronously in order
+// Enable WAL mode for better concurrency - but make it synchronous for reliability
 db.serialize(() => {
     db.exec('PRAGMA journal_mode = WAL;');
-    db.exec('PRAGMA synchronous = FULL;'); // Maximum data integrity
+    db.exec('PRAGMA synchronous = FULL;'); // Changed from NORMAL to FULL for data integrity
     db.exec('PRAGMA cache_size = 1000;');
     db.exec('PRAGMA temp_store = memory;');
     db.exec('PRAGMA busy_timeout = 30000;'); // 30 second timeout for busy database
-    db.exec('PRAGMA foreign_keys = ON;');
+    db.exec('PRAGMA foreign_keys = ON;'); // Enable foreign key constraints
     db.exec('PRAGMA locking_mode = EXCLUSIVE;'); // Exclusive locking mode
-    console.log('[telnyx-phone-system] Database PRAGMA settings applied for maximum consistency');
+    console.log('Database PRAGMA settings applied');
 });
 
-// Enhanced promisified database methods with queue and better error handling
+// Promisify database methods with queue
 const dbRun = (sql, params = []) => {
-    const operationName = `RUN: ${sql.substring(0, 50)}...`;
     return dbQueue.execute(() => {
         return new Promise((resolve, reject) => {
             db.run(sql, params, function(err) {
                 if (err) {
-                    console.error('[telnyx-phone-system] Database RUN error:', err, 'SQL:', sql, 'Params:', params);
+                    console.error('Database RUN error:', err, 'SQL:', sql, 'Params:', params);
                     reject(err);
                 } else {
-                    console.log('[telnyx-phone-system] Database RUN success:', sql.substring(0, 100), 'Changes:', this.changes, 'LastID:', this.lastID);
+                    console.log('Database RUN success:', sql, 'Changes:', this.changes, 'LastID:', this.lastID);
                     resolve({ changes: this.changes, lastID: this.lastID });
                 }
             });
         });
-    }, operationName);
+    });
 };
 
 const dbAll = (sql, params = []) => {
-    const operationName = `ALL: ${sql.substring(0, 50)}...`;
     return dbQueue.execute(() => {
         return new Promise((resolve, reject) => {
             db.all(sql, params, (err, rows) => {
                 if (err) {
-                    console.error('[telnyx-phone-system] Database ALL error:', err, 'SQL:', sql, 'Params:', params);
+                    console.error('Database ALL error:', err, 'SQL:', sql, 'Params:', params);
                     reject(err);
                 } else {
-                    console.log('[telnyx-phone-system] Database ALL success:', sql.substring(0, 100), 'Rows:', rows.length);
+                    console.log('Database ALL success:', sql, 'Rows:', rows.length);
                     resolve(rows);
                 }
             });
         });
-    }, operationName);
+    });
 };
 
 const dbGet = (sql, params = []) => {
-    const operationName = `GET: ${sql.substring(0, 50)}...`;
     return dbQueue.execute(() => {
         return new Promise((resolve, reject) => {
             db.get(sql, params, (err, row) => {
                 if (err) {
-                    console.error('[telnyx-phone-system] Database GET error:', err, 'SQL:', sql, 'Params:', params);
+                    console.error('Database GET error:', err, 'SQL:', sql, 'Params:', params);
                     reject(err);
                 } else {
-                    console.log('[telnyx-phone-system] Database GET success:', sql.substring(0, 100), 'Found:', !!row);
+                    console.log('Database GET success:', sql, 'Found:', !!row);
                     resolve(row);
                 }
             });
         });
-    }, operationName);
+    });
 };
 
 // Middleware
@@ -147,7 +127,7 @@ app.use(express.static(join(__dirname, 'public')));
 
 // Initialize database tables
 async function initDatabase() {
-    console.log('[telnyx-phone-system] Initializing SQLite database tables...');
+    console.log('Initializing SQLite database tables...');
     
     try {
         await dbRun(`
@@ -170,7 +150,7 @@ async function initDatabase() {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
-        console.log('[telnyx-phone-system] Calls table initialized');
+        console.log('Calls table initialized');
         
         await dbRun(`
             CREATE TABLE IF NOT EXISTS customers (
@@ -185,7 +165,7 @@ async function initDatabase() {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
-        console.log('[telnyx-phone-system] Customers table initialized');
+        console.log('Customers table initialized');
         
         await dbRun(`
             CREATE TABLE IF NOT EXISTS contractors (
@@ -201,19 +181,14 @@ async function initDatabase() {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
-        console.log('[telnyx-phone-system] Contractors table initialized');
-        
-        // Create indexes for better performance
-        await dbRun('CREATE INDEX IF NOT EXISTS idx_calls_call_id ON calls(call_id)');
-        await dbRun('CREATE INDEX IF NOT EXISTS idx_calls_status ON calls(status)');
-        await dbRun('CREATE INDEX IF NOT EXISTS idx_calls_start_time ON calls(start_time)');
+        console.log('Contractors table initialized');
         
         // Check existing data
         const existingCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
-        console.log('[telnyx-phone-system] Existing calls in database:', existingCalls.count);
+        console.log('Existing calls in database:', existingCalls.count);
         
     } catch (error) {
-        console.error('[telnyx-phone-system] Error initializing database:', error);
+        console.error('Error initializing database:', error);
         throw error;
     }
 }
@@ -231,86 +206,70 @@ app.get('/api/stats', (req, res) => {
     res.json(callStats);
 });
 
-// Webhook handler for incoming calls with enhanced consistency
+// Webhook handler for incoming calls
 app.post('/webhooks/calls', async (req, res) => {
-    const timestamp = new Date().toISOString();
-    console.log(`[telnyx-phone-system] [${timestamp}] Raw webhook received:`, JSON.stringify(req.body, null, 2));
+    console.log('Raw webhook received:', JSON.stringify(req.body, null, 2));
     
     const { data } = req.body;
     const callId = data.payload?.call_control_id || data.call_control_id;
-    console.log(`[telnyx-phone-system] [${timestamp}] Webhook received: ${data.event_type} CallID: ${callId}`);
-    console.log(`[telnyx-phone-system] [${timestamp}] Payload:`, JSON.stringify(data.payload, null, 2));
+    console.log('Webhook received:', data.event_type, 'CallID:', callId);
+    console.log('Payload:', JSON.stringify(data.payload, null, 2));
 
     try {
         switch (data.event_type) {
             case 'call.initiated':
-                await handleIncomingCall(data, timestamp);
+                await handleIncomingCall(data);
                 break;
             case 'call.answered':
-                await handleCallAnswered(data, timestamp);
+                await handleCallAnswered(data);
                 break;
             case 'call.hangup':
-                await handleCallHangup(data, timestamp);
+                await handleCallHangup(data);
                 break;
             case 'call.recording.saved':
-                await handleRecordingSaved(data, timestamp);
+                await handleRecordingSaved(data);
                 break;
             case 'call.dtmf.received':
-                await handleDTMF(data, timestamp);
+                await handleDTMF(data);
                 break;
-            default:
-                console.log(`[telnyx-phone-system] [${timestamp}] Unhandled event: ${data.event_type}`);
         }
     } catch (error) {
-        console.error(`[telnyx-phone-system] [${timestamp}] Webhook error:`, error);
+        console.error('Webhook error:', error);
     }
 
     res.status(200).send('OK');
 });
 
-// Handle incoming calls with enhanced consistency and verification
-async function handleIncomingCall(data, timestamp) {
+// Handle incoming calls - simplified without memory
+async function handleIncomingCall(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
     const fromNumber = data.payload?.from || data.from;
     const toNumber = data.payload?.to || data.to;
-    const startTime = data.payload?.start_time || timestamp;
 
-    console.log(`[telnyx-phone-system] [${timestamp}] Handling incoming call: ${callId} from ${fromNumber} to ${toNumber}`);
+    console.log('Handling incoming call:', callId, 'from', fromNumber, 'to', toNumber);
 
-    // Store call record in database with enhanced verification
+    // Store call record in database with explicit transaction
     try {
-        console.log(`[telnyx-phone-system] [${timestamp}] Attempting to insert call record into database...`);
-        
-        // First, check if record already exists to avoid duplicates
-        const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        if (existingCall) {
-            console.log(`[telnyx-phone-system] [${timestamp}] Call record already exists with ID: ${existingCall.id}`);
-            return; // Skip duplicate processing
-        }
+        console.log('Attempting to insert call record into database...');
         
         const result = await dbRun(`
             INSERT OR REPLACE INTO calls 
             (call_id, direction, from_number, to_number, status, start_time, call_type)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        `, [callId, 'inbound', fromNumber, toNumber, 'initiated', startTime, 'customer_inquiry']);
+        `, [callId, 'inbound', fromNumber, toNumber, 'initiated', new Date().toISOString(), 'customer_inquiry']);
         
-        console.log(`[telnyx-phone-system] [${timestamp}] Call record inserted successfully. Row ID: ${result?.lastID}`);
+        console.log('Call record inserted successfully. Row ID:', result?.lastID);
         
-        // Immediate verification with a small delay to ensure consistency
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Verify the insert worked with a fresh query
         const insertedCall = await dbGet('SELECT * FROM calls WHERE call_id = ? ORDER BY id DESC LIMIT 1', [callId]);
-        console.log(`[telnyx-phone-system] [${timestamp}] Verified inserted call:`, insertedCall ? `ID: ${insertedCall.id}, Status: ${insertedCall.status}` : 'NOT FOUND');
+        console.log('Verified inserted call:', insertedCall ? `ID: ${insertedCall.id}, Status: ${insertedCall.status}` : 'NOT FOUND');
         
         // Double check total count for debugging
         const totalCount = await dbGet('SELECT COUNT(*) as count FROM calls');
-        console.log(`[telnyx-phone-system] [${timestamp}] Total calls after insert:`, totalCount);
-        
-        if (!insertedCall) {
-            console.error(`[telnyx-phone-system] [${timestamp}] CRITICAL ERROR: Call was not properly inserted!`);
-        }
+        console.log('Total calls after insert:', totalCount);
         
     } catch (dbError) {
-        console.error(`[telnyx-phone-system] [${timestamp}] Database error inserting call:`, dbError);
+        console.error('Database error inserting call:', dbError);
     }
 
     try {
@@ -327,11 +286,11 @@ async function handleIncomingCall(data, timestamp) {
 
         if (!answerResponse.ok) {
             const errorData = await answerResponse.text();
-            console.error(`[telnyx-phone-system] [${timestamp}] Failed to answer call:`, answerResponse.status, errorData);
+            console.error('Failed to answer call:', answerResponse.status, errorData);
             return;
         }
 
-        console.log(`[telnyx-phone-system] [${timestamp}] Call answered successfully`);
+        console.log('Call answered successfully');
         
         // Start recording using direct HTTP API
         const recordResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
@@ -348,107 +307,64 @@ async function handleIncomingCall(data, timestamp) {
         });
 
         if (recordResponse.ok) {
-            console.log(`[telnyx-phone-system] [${timestamp}] Recording started`);
+            console.log('Recording started');
         } else {
-            console.log(`[telnyx-phone-system] [${timestamp}] Recording failed, but continuing...`);
+            console.log('Recording failed, but continuing...');
         }
         
         // Wait a moment then play greeting and gather input
         setTimeout(async () => {
-            try {
-                const gatherResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/gather_using_speak`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json',
-                        'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
-                    },
-                    body: JSON.stringify({
-    payload: "Thank you for calling Weather Pro Solutions, your trusted flood damage restoration specialists. We understand water damage is urgent and stressful. If this is a flooding emergency requiring immediate water extraction, press 1. For insurance claims assistance and damage assessment, press 2. For mold remediation and restoration services, press 3. To speak directly with our emergency response team, press 0.",
-    voice: 'female',
-    language: 'en-US',
-    minimum_digits: 1,
-    maximum_digits: 1,
-    timeout_millis: 10000,
-    terminating_digit: '#'
-})
-                });
-                
-                if (gatherResponse.ok) {
-                    console.log(`[telnyx-phone-system] [${timestamp}] IVR menu played successfully`);
-                } else {
-                    const gatherErrorData = await gatherResponse.text();
-                    console.error(`[telnyx-phone-system] [${timestamp}] Failed to play IVR menu:`, gatherResponse.status, gatherErrorData);
-                }
-            } catch (error) {
-                console.error(`[telnyx-phone-system] [${timestamp}] Error playing IVR menu:`, error);
-            }
+            await playIVRMenu(callId);
         }, 2000);
         
     } catch (error) {
-        console.error(`[telnyx-phone-system] [${timestamp}] Error in handleIncomingCall:`, error);
+        console.error('Error in handleIncomingCall:', error);
     }
 }
 
-// Handle call answered with better consistency
-async function handleCallAnswered(data, timestamp) {
+// Handle call answered
+async function handleCallAnswered(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
     
-    console.log(`[telnyx-phone-system] [${timestamp}] Processing call.answered for: ${callId}`);
+    console.log('Processing call.answered for:', callId);
     
     try {
-        // Add small delay to ensure any pending writes complete
-        await new Promise(resolve => setTimeout(resolve, 200));
-        
         // First verify the record exists before updating
         const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log(`[telnyx-phone-system] [${timestamp}] Found existing call for answered:`, !!existingCall, existingCall ? `ID: ${existingCall.id}, Status: ${existingCall.status}` : 'NONE');
+        console.log('Found existing call for answered:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
         
         if (!existingCall) {
-            console.log(`[telnyx-phone-system] [${timestamp}] Creating missing call record for answered event`);
-            
-            // Create missing call record
-            const result = await dbRun(`
-                INSERT OR REPLACE INTO calls 
-                (call_id, direction, from_number, to_number, status, start_time, call_type, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
-                callId,
-                'inbound',
-                data.payload?.from || 'unknown',
-                data.payload?.to || 'unknown',
-                'answered',
-                data.payload?.start_time || timestamp,
-                'customer_inquiry',
-                timestamp
-            ]);
-            
-            console.log(`[telnyx-phone-system] [${timestamp}] Created missing call record. Row ID: ${result?.lastID}`);
-        } else {
-            // Update existing call status
-            const result = await dbRun(`
-                UPDATE calls 
-                SET status = 'answered'
-                WHERE call_id = ?
-            `, [callId]);
-            
-            console.log(`[telnyx-phone-system] [${timestamp}] Call status updated to answered for: ${callId}, Rows affected: ${result?.changes || 0}`);
-            
-            if ((result?.changes || 0) === 0) {
-                console.error(`[telnyx-phone-system] [${timestamp}] WARNING: Answered update affected 0 rows for call: ${callId}`);
-            }
+            console.error('ERROR: Cannot update answered - call record not found for:', callId);
+            return;
+        }
+
+        // Check if this is a human representative call (outbound call to human)
+        if (existingCall.call_type === 'human_representative') {
+            console.log('Human representative answered, connecting to conference');
+            await handleHumanRepresentativeAnswered(callId, existingCall);
+        }
+
+        const result = await dbRun(`
+            UPDATE calls 
+            SET status = 'answered'
+            WHERE call_id = ?
+        `, [callId]);
+        
+        console.log('Call status updated to answered for:', callId, 'Rows affected:', result?.changes || 0);
+        
+        if ((result?.changes || 0) === 0) {
+            console.error('WARNING: Answered update affected 0 rows for call:', callId);
         }
         
-        // Verify the update/insert worked
+        // Verify the update worked
         const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log(`[telnyx-phone-system] [${timestamp}] Verified call status after answered:`, {
+        console.log('Verified call status after update:', {
             found: !!updatedCall,
-            status: updatedCall?.status,
-            id: updatedCall?.id
+            status: updatedCall?.status
         });
         
     } catch (error) {
-        console.error(`[telnyx-phone-system] [${timestamp}] Error updating call status:`, error);
+        console.error('Error updating call status:', error);
     }
 
     activeCalls.set(callId, {
@@ -458,181 +374,111 @@ async function handleCallAnswered(data, timestamp) {
     });
 }
 
-// Handle call hangup with better consistency
-async function handleCallHangup(data, timestamp) {
-    const callId = data.payload?.call_control_id || data.call_control_id;
-    const endTime = data.payload?.end_time || timestamp;
-    const startTime = data.payload?.start_time;
-    
-    let duration = 0;
-    if (startTime && endTime) {
-        duration = Math.round((new Date(endTime) - new Date(startTime)) / 1000);
-    }
-
-    console.log(`[telnyx-phone-system] [${timestamp}] Processing call.hangup for: ${callId} Duration: ${duration}s`);
-
+// Handle when human representative answers their phone
+async function handleHumanRepresentativeAnswered(humanCallId, humanCallRecord) {
     try {
-        // Add small delay to ensure any pending writes complete
-        await new Promise(resolve => setTimeout(resolve, 200));
+        console.log('Human representative answered call:', humanCallId);
         
-        // First verify the record exists before updating
-        const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log(`[telnyx-phone-system] [${timestamp}] Found existing call for hangup:`, !!existingCall, existingCall ? `ID: ${existingCall.id}, Status: ${existingCall.status}` : 'NONE');
+        // Find the conference room for this human call
+        let conferenceId = null;
+        let customerCallId = null;
         
-        if (!existingCall) {
-            console.log(`[telnyx-phone-system] [${timestamp}] Creating missing call record for hangup event`);
-            
-            // Create missing call record with completed status
-            const result = await dbRun(`
-                INSERT OR REPLACE INTO calls 
-                (call_id, direction, from_number, to_number, status, start_time, end_time, duration, call_type, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
-                callId,
-                'inbound',
-                data.payload?.from || 'unknown',
-                data.payload?.to || 'unknown',
-                'completed',
-                startTime || timestamp,
-                endTime,
-                duration,
-                'customer_inquiry',
-                timestamp
-            ]);
-            
-            console.log(`[telnyx-phone-system] [${timestamp}] Created missing call record for hangup. Row ID: ${result?.lastID}`);
-        } else {
-            // Update existing call
-            const result = await dbRun(`
-                UPDATE calls 
-                SET status = 'completed', end_time = ?, duration = ?
-                WHERE call_id = ?
-            `, [endTime, duration, callId]);
-            
-            console.log(`[telnyx-phone-system] [${timestamp}] Call hangup processed for: ${callId}, Rows affected: ${result?.changes || 0}`);
-            
-            if ((result?.changes || 0) === 0) {
-                console.error(`[telnyx-phone-system] [${timestamp}] WARNING: Hangup update affected 0 rows for call: ${callId}`);
+        for (const [confId, conf] of conferenceRooms) {
+            if (conf.human === humanCallId) {
+                conferenceId = confId;
+                customerCallId = conf.customer;
+                break;
             }
         }
         
-        // Verify the update worked
-        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log(`[telnyx-phone-system] [${timestamp}] Verified call after hangup:`, {
-            found: !!updatedCall,
-            status: updatedCall?.status,
-            duration: updatedCall?.duration,
-            end_time: updatedCall?.end_time
-        });
-        
-    } catch (error) {
-        console.error(`[telnyx-phone-system] [${timestamp}] Error updating call hangup:`, error);
-    }
-
-    activeCalls.delete(callId);
-
-    // Clean up any conference rooms
-    for (const [confId, conf] of conferenceRooms) {
-        if (conf.customer === callId || conf.contractor === callId) {
-            conferenceRooms.delete(confId);
-            break;
+        if (!conferenceId) {
+            console.error('No conference room found for human call:', humanCallId);
+            return;
         }
-    }
-}
+        
+        console.log('Found conference room:', conferenceId, 'for customer:', customerCallId);
+        
+        // Greet the human representative with context
+        await speakToCall(humanCallId, "Hello, this is Weather Pro Solutions. You have a customer waiting on the line who needs to speak with a representative. You will now be connected to the customer.");
+        
+        // Transfer human to the conference room (where customer is waiting)
+        setTimeout(async () => {
+            const transferResponse = await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/transfer`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+                },
+                body: JSON.stringify({
+                    to: `conference:${conferenceId}`
+                })
+            });
 
-// Handle recording saved with better consistency
-async function handleRecordingSaved(data, timestamp) {
-    const callId = data.payload?.call_control_id || data.call_control_id;
-    const recordingUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
-    const recordingId = data.payload?.recording_id || data.recording_id;
-    
-    console.log(`[telnyx-phone-system] [${timestamp}] Recording saved for call: ${callId}`);
-    console.log(`[telnyx-phone-system] [${timestamp}] Recording URL: ${recordingUrl}`);
-    console.log(`[telnyx-phone-system] [${timestamp}] Recording ID: ${recordingId}`);
-    
-    try {
-        // Add small delay to ensure any pending writes complete
-        await new Promise(resolve => setTimeout(resolve, 200));
-        
-        // First verify the record exists before updating
-        const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log(`[telnyx-phone-system] [${timestamp}] Found existing call for recording:`, !!existingCall, existingCall ? `ID: ${existingCall.id}, Status: ${existingCall.status}` : 'NONE');
-        
-        if (!existingCall) {
-            console.log(`[telnyx-phone-system] [${timestamp}] Creating missing call record for recording event`);
-            
-            // Create missing call record with recording
-            const result = await dbRun(`
-                INSERT OR REPLACE INTO calls 
-                (call_id, direction, from_number, to_number, status, start_time, recording_url, call_type, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
-                callId,
-                'inbound',
-                'unknown',
-                'unknown',
-                'completed',
-                timestamp,
-                recordingUrl,
-                'customer_inquiry',
-                timestamp
-            ]);
-            
-            console.log(`[telnyx-phone-system] [${timestamp}] Created missing call record with recording. Row ID: ${result?.lastID}`);
-        } else {
-            // Update existing call with recording URL
-            const result = await dbRun(`
-                UPDATE calls 
-                SET recording_url = ?
-                WHERE call_id = ?
-            `, [recordingUrl, callId]);
-            
-            console.log(`[telnyx-phone-system] [${timestamp}] Database updated with recording URL, rows affected: ${result?.changes || 0}`);
-            
-            if ((result?.changes || 0) === 0) {
-                console.error(`[telnyx-phone-system] [${timestamp}] WARNING: Recording update affected 0 rows for call: ${callId}`);
+            if (transferResponse.ok) {
+                console.log('Human representative transferred to conference successfully');
+                
+                // Update conference room status
+                const conference = conferenceRooms.get(conferenceId);
+                if (conference) {
+                    conference.status = 'connected';
+                    conference.connectedAt = new Date();
+                    conferenceRooms.set(conferenceId, conference);
+                }
+                
+                // Update call records
+                await dbRun(`
+                    UPDATE calls 
+                    SET call_type = 'human_connected', notes = 'Successfully connected to human representative'
+                    WHERE call_id = ?
+                `, [customerCallId]);
+                
+            } else {
+                const errorData = await transferResponse.text();
+                console.error('Failed to transfer human to conference:', transferResponse.status, errorData);
+                await speakToCall(humanCallId, "I apologize, there was a technical issue connecting you to the customer. Please hang up and we'll try to reach you again.");
             }
-        }
-        
-        // Verify the update worked
-        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        console.log(`[telnyx-phone-system] [${timestamp}] Updated call record - has recording URL:`, {
-            found: !!updatedCall,
-            hasRecording: !!updatedCall?.recording_url,
-            status: updatedCall?.status
-        });
+        }, 3000); // Give human rep 3 seconds to hear the greeting
         
     } catch (error) {
-        console.error(`[telnyx-phone-system] [${timestamp}] Database update failed:`, error);
+        console.error('Error handling human representative answer:', error);
     }
-
-    // Generate transcript
-    await generateTranscript(callId, recordingUrl);
 }
 
 // Handle DTMF (keypad) input
-async function handleDTMF(data, timestamp) {
+async function handleDTMF(data) {
     const callId = data.payload?.call_control_id || data.call_control_id;
     const digit = data.payload?.digit || data.digit;
     
-    console.log(`[telnyx-phone-system] [${timestamp}] DTMF received: ${digit} for call ${callId}`);
+    console.log(`DTMF received: ${digit} for call ${callId}`);
 
-    switch (digit) {
-        case '1':
-            // Emergency - immediate connection
-            await speakToCall(callId, "This is an emergency roofing call. Please hold while we connect you with an available contractor for immediate assistance.");
-            // Find and call emergency contractor
-            await connectToEmergencyContractor(callId);
-            break;
-        case '2':
-            // General inquiry - collect information
-            await collectCustomerInfo(callId);
-            break;
-        case '0':
-            // Speak with representative
-            await speakToCall(callId, "Please hold while we connect you with a Weather Pro Solutions representative.");
-            // You would implement your logic to connect to your team
-            break;
+    try {
+        switch (digit) {
+            case '1':
+                // Emergency/Human - immediate connection to live person
+                await speakToCall(callId, "Please hold while we connect you with a live representative. You will remain on this recorded line.");
+                // Connect to human representative
+                await connectToHuman(callId);
+                break;
+            case '2':
+                // General inquiry - collect information
+                await collectCustomerInfo(callId);
+                break;
+            case '0':
+                // Speak with representative (same as 1)
+                await speakToCall(callId, "Please hold while we connect you with a Weather Pro Solutions representative.");
+                await connectToHuman(callId);
+                break;
+            default:
+                // Invalid input - replay menu
+                await speakToCall(callId, "Invalid selection. Please try again.");
+                setTimeout(async () => {
+                    await playIVRMenu(callId);
+                }, 2000);
+                break;
+        }
+    } catch (error) {
+        console.error('Error handling DTMF:', error);
     }
 }
 
@@ -690,32 +536,36 @@ async function collectCustomerInfo(callId) {
     }
 }
 
-// Connect to emergency contractor
-async function connectToEmergencyContractor(callId) {
+// Connect to human representative
+async function connectToHuman(callId) {
     try {
-        // Get available emergency contractor
-        const contractor = await dbGet(`
-            SELECT * FROM contractors 
-            WHERE availability = 'available'
-            AND specialties LIKE '%emergency%'
-            ORDER BY rating DESC 
-            LIMIT 1
-        `);
-
-        if (!contractor) {
-            await speakToCall(callId, "I apologize, but no emergency contractors are currently available. We are connecting you to our on-call service.");
+        console.log('Connecting customer to human representative for call:', callId);
+        
+        // Configuration for human representative
+        const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER || '+1234567890'; // Replace with actual number
+        
+        if (humanPhoneNumber === '+1234567890') {
+            console.error('HUMAN_PHONE_NUMBER not configured in environment variables');
+            await speakToCall(callId, "I apologize, but our representative phone number is not configured. Please call back later or leave a voicemail.");
             return;
         }
 
-        // Create conference room
-        const conferenceId = `conf_${Date.now()}`;
-        conferenceRooms.set(conferenceId, {
-            customer: callId,
-            contractor: null,
-            created: new Date()
-        });
+        // Update call record to show human connection attempt
+        await dbRun(`
+            UPDATE calls 
+            SET call_type = 'human_transfer', notes = 'Customer transferred to human representative'
+            WHERE call_id = ?
+        `, [callId]);
 
-        // Transfer customer to conference
+        // First, tell the customer what's happening
+        await speakToCall(callId, "Connecting you now. Please remain on the line while we dial our representative.");
+
+        // Create a conference room for the three-way call
+        const conferenceId = `human_${Date.now()}`;
+        
+        console.log('Creating conference room:', conferenceId);
+        
+        // Transfer customer to conference room
         const transferResponse = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/transfer`, {
             method: 'POST',
             headers: {
@@ -724,17 +574,23 @@ async function connectToEmergencyContractor(callId) {
                 'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
             },
             body: JSON.stringify({
-                to: `conference:${conferenceId}`
+                to: `conference:${conferenceId}`,
+                // Keep recording active during transfer
+                record: 'record-from-answer'
             })
         });
 
         if (!transferResponse.ok) {
-            console.error('Failed to transfer to conference:', transferResponse.status);
+            const errorData = await transferResponse.text();
+            console.error('Failed to transfer customer to conference:', transferResponse.status, errorData);
+            await speakToCall(callId, "I apologize, but we're having technical difficulties. Please try calling back in a few minutes.");
             return;
         }
 
-        // Call contractor
-        const contractorCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
+        console.log('Customer transferred to conference successfully');
+
+        // Now call the human representative
+        const humanCallResponse = await fetch('https://api.telnyx.com/v2/calls', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -742,38 +598,244 @@ async function connectToEmergencyContractor(callId) {
                 'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
             },
             body: JSON.stringify({
-                to: contractor.phone_number,
+                to: humanPhoneNumber,
                 from: process.env.TELNYX_PHONE_NUMBER,
-                webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls'
+                webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls',
+                // Automatically transfer to conference when answered
+                machine_detection: 'disabled',
+                timeout_secs: 30
             })
         });
 
-        if (contractorCallResponse.ok) {
-            const contractorCall = await contractorCallResponse.json();
-            
-            // Store contractor call info
-            await dbRun(`
-                INSERT INTO calls 
-                (call_id, direction, from_number, to_number, status, start_time, call_type, contractor_info)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `, 
-            [
-                contractorCall.data.call_control_id,
-                'outbound',
-                process.env.TELNYX_PHONE_NUMBER,
-                contractor.phone_number,
-                'initiated',
-                new Date().toISOString(),
-                'contractor_connect',
-                JSON.stringify(contractor)
-            ]);
-
-            conferenceRooms.get(conferenceId).contractor = contractorCall.data.call_control_id;
+        if (!humanCallResponse.ok) {
+            const errorData = await humanCallResponse.text();
+            console.error('Failed to call human representative:', humanCallResponse.status, errorData);
+            await speakToCall(callId, "I apologize, but we're unable to reach our representative right now. Please leave a detailed message and we'll call you back shortly.");
+            return;
         }
 
+        const humanCall = await humanCallResponse.json();
+        const humanCallId = humanCall.data.call_control_id;
+        
+        console.log('Human representative call initiated:', humanCallId);
+
+        // Store the human call record
+        await dbRun(`
+            INSERT INTO calls 
+            (call_id, direction, from_number, to_number, status, start_time, call_type, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            humanCallId,
+            'outbound',
+            process.env.TELNYX_PHONE_NUMBER,
+            humanPhoneNumber,
+            'initiated',
+            new Date().toISOString(),
+            'human_representative',
+            `Calling representative for customer call ${callId}`
+        ]);
+
+        // Store conference information
+        conferenceRooms.set(conferenceId, {
+            customer: callId,
+            human: humanCallId,
+            created: new Date(),
+            type: 'human_transfer'
+        });
+
+        // Set up a timeout to handle if human doesn't answer
+        setTimeout(async () => {
+            const conference = conferenceRooms.get(conferenceId);
+            if (conference && conference.status !== 'connected') {
+                console.log('Human representative did not answer within timeout');
+                await handleHumanNoAnswer(callId, conferenceId);
+            }
+        }, 35000); // 35 second timeout
+
     } catch (error) {
-        console.error('Error connecting to contractor:', error);
+        console.error('Error connecting to human representative:', error);
+        await speakToCall(callId, "I apologize, but we're experiencing technical difficulties. Please call back in a few minutes or leave a detailed message.");
     }
+}
+
+// Handle when human representative doesn't answer
+async function handleHumanNoAnswer(callId, conferenceId) {
+    try {
+        console.log('Human representative did not answer, providing fallback options');
+        
+        // Remove from conference tracking
+        conferenceRooms.delete(conferenceId);
+        
+        // Speak to the customer with options
+        await speakToCall(callId, "I apologize, but our representative is currently unavailable. Please choose from the following options: Press 2 to leave a detailed message about your roofing needs, or stay on the line to hear our main menu again.");
+        
+        // Set up gather for customer choice
+        setTimeout(async () => {
+            await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/gather_using_speak`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+                },
+                body: JSON.stringify({
+                    payload: "Press 2 to leave a message, or any other key to hear our menu again.",
+                    voice: 'female',
+                    language: 'en-US',
+                    minimum_digits: 1,
+                    maximum_digits: 1,
+                    timeout_millis: 10000,
+                    terminating_digit: '#'
+                })
+            });
+        }, 3000);
+        
+    } catch (error) {
+        console.error('Error handling human no answer:', error);
+    }
+}
+
+// Play IVR menu (extracted to reusable function)
+async function playIVRMenu(callId) {
+    try {
+        const response = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/gather_using_speak`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
+            },
+            body: JSON.stringify({
+                payload: "Thank you for calling Weather Pro Solutions, your trusted roofing and exterior specialists. If you need to speak with a representative immediately, press 1. For general inquiries about roofing, siding, or gutters, press 2. To speak with a representative, press 0.",
+                voice: 'female',
+                language: 'en-US',
+                minimum_digits: 1,
+                maximum_digits: 1,
+                timeout_millis: 10000,
+                terminating_digit: '#'
+            })
+        });
+        
+        if (response.ok) {
+            console.log('IVR menu played successfully for call:', callId);
+        } else {
+            console.error('Failed to play IVR menu:', response.status);
+        }
+    } catch (error) {
+        console.error('Error playing IVR menu:', error);
+    }
+}
+
+// Handle call hangup
+async function handleCallHangup(data) {
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    const endTime = new Date().toISOString();
+    const callInfo = activeCalls.get(callId);
+    const duration = callInfo ? Math.floor((new Date() - callInfo.startTime) / 1000) : 0;
+
+    console.log('Processing call.hangup for:', callId, 'Duration:', duration + 's');
+
+    try {
+        // First verify the record exists before updating
+        const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Found existing call for hangup:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
+        
+        if (!existingCall) {
+            console.error('ERROR: Cannot update hangup - call record not found for:', callId);
+            return;
+        }
+
+        const result = await dbRun(`
+            UPDATE calls 
+            SET status = 'completed', end_time = ?, duration = ?
+            WHERE call_id = ?
+        `, [endTime, duration, callId]);
+        
+        console.log('Call hangup processed for:', callId, 'Rows affected:', result?.changes || 0);
+        
+        if ((result?.changes || 0) === 0) {
+            console.error('WARNING: Hangup update affected 0 rows for call:', callId);
+        }
+        
+        // Verify the update worked
+        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Verified call after hangup:', {
+            found: !!updatedCall,
+            status: updatedCall?.status,
+            duration: updatedCall?.duration,
+            end_time: updatedCall?.end_time
+        });
+        
+    } catch (error) {
+        console.error('Error updating call hangup:', error);
+    }
+
+    activeCalls.delete(callId);
+
+    // Clean up any conference rooms
+    for (const [confId, conf] of conferenceRooms) {
+        if (conf.customer === callId || conf.contractor === callId) {
+            conferenceRooms.delete(confId);
+            break;
+        }
+    }
+}
+
+// Handle recording saved - simplified
+async function handleRecordingSaved(data) {
+    const callId = data.payload?.call_control_id || data.call_control_id;
+    const recordingUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
+    const recordingId = data.payload?.recording_id || data.recording_id;
+    
+    console.log('Recording saved for call:', callId);
+    console.log('Recording URL:', recordingUrl);
+    console.log('Recording ID:', recordingId);
+    
+    // Try to update database with explicit transaction
+    try {
+        // First verify the record exists before updating
+        const existingCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Found existing call for recording:', !!existingCall, existingCall ? `ID: ${existingCall.id}` : 'NONE');
+        
+        if (!existingCall) {
+            console.error('ERROR: Cannot update recording - call record not found for:', callId);
+            return;
+        }
+
+        await dbRun('BEGIN IMMEDIATE');
+        
+        const result = await dbRun(`
+            UPDATE calls 
+            SET recording_url = ?
+            WHERE call_id = ?
+        `, [recordingUrl, callId]);
+        
+        await dbRun('COMMIT');
+        
+        console.log('Database updated with recording URL, rows affected:', result?.changes || 0);
+        
+        if ((result?.changes || 0) === 0) {
+            console.error('WARNING: Recording update affected 0 rows for call:', callId);
+        }
+        
+        // Verify the update worked
+        const updatedCall = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        console.log('Updated call record - has recording URL:', {
+            found: !!updatedCall,
+            hasRecording: !!updatedCall?.recording_url
+        });
+        
+    } catch (error) {
+        console.error('Database update failed:', error);
+        try {
+            await dbRun('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('Error rolling back transaction:', rollbackError);
+        }
+    }
+
+    // Generate transcript
+    await generateTranscript(callId, recordingUrl);
 }
 
 // Generate transcript using speech-to-text service
@@ -791,168 +853,7 @@ async function generateTranscript(callId, recordingUrl) {
     }
 }
 
-// API Routes with enhanced consistency
-// Get call records with better database handling
-app.get('/api/calls', async (req, res) => {
-    try {
-        const timestamp = new Date().toISOString();
-        const { limit = 50, offset = 0, type } = req.query;
-        
-        console.log(`[telnyx-phone-system] [${timestamp}] API calls endpoint hit - checking database...`);
-        
-        let calls = [];
-        let databaseWorking = false;
-        
-        try {
-            // Test database connection with a longer delay to ensure consistency
-            await new Promise(resolve => setTimeout(resolve, 300));
-            
-            const testQuery = await dbGet('SELECT COUNT(*) as count FROM calls');
-            console.log(`[telnyx-phone-system] [${timestamp}] Database test - total calls:`, testQuery);
-            
-            let query = 'SELECT * FROM calls';
-            let params = [];
-
-            if (type) {
-                query += ' WHERE call_type = ?';
-                params.push(type);
-            }
-
-            query += ' ORDER BY start_time DESC LIMIT ? OFFSET ?';
-            params.push(parseInt(limit), parseInt(offset));
-            
-            console.log(`[telnyx-phone-system] [${timestamp}] Executing query:`, query, 'with params:', params);
-            calls = await dbAll(query, params);
-            console.log(`[telnyx-phone-system] [${timestamp}] Query result - found calls:`, calls.length);
-            databaseWorking = true;
-            
-            // If we found calls, log them for debugging
-            if (calls.length > 0) {
-                console.log(`[telnyx-phone-system] [${timestamp}] Sample call:`, JSON.stringify(calls[0], null, 2));
-            }
-            
-        } catch (dbError) {
-            console.log(`[telnyx-phone-system] [${timestamp}] Database not working, using memory fallback:`, dbError.message);
-            calls = [];
-        }
-        
-        console.log(`[telnyx-phone-system] [${timestamp}] Final call details count:`, calls.length);
-        
-        res.json({
-            calls: calls,
-            source: databaseWorking ? 'database' : 'memory',
-            timestamp: timestamp
-        });
-    } catch (error) {
-        console.error('[telnyx-phone-system] Error in /api/calls endpoint:', error);
-        console.error('[telnyx-phone-system] Error stack:', error.stack);
-        res.status(500).json({ 
-            error: error.message, 
-            stack: error.stack,
-            calls: [], // Simple fallback
-            source: 'error'
-        });
-    }
-});
-
-// Get call details
-app.get('/api/calls/:callId', async (req, res) => {
-    try {
-        const { callId } = req.params;
-        const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-        
-        if (!call) {
-            return res.status(404).json({ error: 'Call not found' });
-        }
-        
-        res.json(call);
-    } catch (error) {
-        console.error('Error fetching call details:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Dashboard endpoint with better consistency
-app.get('/api/dashboard', async (req, res) => {
-    try {
-        const timestamp = new Date().toISOString();
-        console.log(`[telnyx-phone-system] [${timestamp}] Dashboard endpoint hit`);
-        
-        // Add delay to ensure database consistency
-        await new Promise(resolve => setTimeout(resolve, 300));
-        
-        const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
-        console.log(`[telnyx-phone-system] [${timestamp}] Total calls in DB:`, totalCalls);
-        
-        const todayCalls = await dbGet(`
-            SELECT COUNT(*) as count FROM calls 
-            WHERE DATE(start_time) = DATE('now')
-        `);
-        console.log(`[telnyx-phone-system] [${timestamp}] Today calls:`, todayCalls);
-        
-        const activeCalls = await dbGet(`
-            SELECT COUNT(*) as count FROM calls 
-            WHERE status = 'answered' OR status = 'initiated'
-        `);
-        console.log(`[telnyx-phone-system] [${timestamp}] Active calls:`, activeCalls);
-        
-        const totalCustomers = await dbGet('SELECT COUNT(*) as count FROM customers');
-        const totalContractors = await dbGet('SELECT COUNT(*) as count FROM contractors');
-
-        // Also get recent calls for debugging
-        const recentCalls = await dbAll('SELECT * FROM calls ORDER BY start_time DESC LIMIT 10');
-        console.log(`[telnyx-phone-system] [${timestamp}] Recent calls for dashboard:`, recentCalls);
-
-        res.json({
-            totalCalls: totalCalls.count,
-            todayCalls: todayCalls.count,
-            activeCalls: activeCalls.count,
-            totalCustomers: totalCustomers.count,  
-            totalContractors: totalContractors.count,
-            recentCalls: recentCalls
-        });
-    } catch (error) {
-        console.error('[telnyx-phone-system] Error fetching dashboard data:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Add customer
-app.post('/api/customers', async (req, res) => {
-    try {
-        const { phoneNumber, name, address, damageType, urgency, notes } = req.body;
-        
-        await dbRun(`
-            INSERT OR REPLACE INTO customers 
-            (phone_number, name, address, damage_type, urgency, notes)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `, [phoneNumber, name, address, damageType, urgency, notes]);
-
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error adding customer:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Add contractor
-app.post('/api/contractors', async (req, res) => {
-    try {
-        const { phoneNumber, name, company, serviceArea, specialties, rating, availability, notes } = req.body;
-        
-        await dbRun(`
-            INSERT OR REPLACE INTO contractors 
-            (phone_number, name, company, service_area, specialties, rating, availability, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, [phoneNumber, name, company, serviceArea, specialties, rating, availability, notes]);
-
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error adding contractor:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
+// API Routes
 // Make outbound call to customer
 app.post('/api/call-customer', async (req, res) => {
     try {
@@ -1107,6 +1008,168 @@ app.post('/api/three-way-call', async (req, res) => {
         });
     } catch (error) {
         console.error('Error creating three-way call:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get call records with recording fallback
+app.get('/api/calls', async (req, res) => {
+    try {
+        const { limit = 50, offset = 0, type } = req.query;
+        
+        // First check if database connection is working
+        console.log('API calls endpoint hit - checking database...');
+        
+        let calls = [];
+        let databaseWorking = false;
+        
+        try {
+            // Test database connection with a small delay to ensure any pending writes complete
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            const testQuery = await dbGet('SELECT COUNT(*) as count FROM calls');
+            console.log('Database test - total calls:', testQuery);
+            
+            let query = 'SELECT * FROM calls';
+            let params = [];
+
+            if (type) {
+                query += ' WHERE call_type = ?';
+                params.push(type);
+            }
+
+            query += ' ORDER BY start_time DESC LIMIT ? OFFSET ?';
+            params.push(parseInt(limit), parseInt(offset));
+            
+            console.log('Executing query:', query, 'with params:', params);
+            calls = await dbAll(query, params);
+            console.log('Query result - found calls:', calls.length);
+            databaseWorking = true;
+            
+            // If we found calls, log them for debugging
+            if (calls.length > 0) {
+                console.log('Sample call:', JSON.stringify(calls[0], null, 2));
+            }
+            
+        } catch (dbError) {
+            console.log('Database not working, using memory fallback:', dbError.message);
+            calls = [];
+        }
+        
+        console.log('Final call details count:', calls.length);
+        
+        res.json({
+            calls: calls,
+            source: databaseWorking ? 'database' : 'memory',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('Error in /api/calls endpoint:', error);
+        console.error('Error stack:', error.stack);
+        res.status(500).json({ 
+            error: error.message, 
+            stack: error.stack,
+            calls: [], // Simple fallback
+            source: 'error'
+        });
+    }
+});
+
+// Get call details
+app.get('/api/calls/:callId', async (req, res) => {
+    try {
+        const { callId } = req.params;
+        const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+        
+        if (!call) {
+            return res.status(404).json({ error: 'Call not found' });
+        }
+        
+        res.json(call);
+    } catch (error) {
+        console.error('Error fetching call details:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Add customer
+app.post('/api/customers', async (req, res) => {
+    try {
+        const { phoneNumber, name, address, damageType, urgency, notes } = req.body;
+        
+        await dbRun(`
+            INSERT OR REPLACE INTO customers 
+            (phone_number, name, address, damage_type, urgency, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `, [phoneNumber, name, address, damageType, urgency, notes]);
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error adding customer:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Add contractor
+app.post('/api/contractors', async (req, res) => {
+    try {
+        const { phoneNumber, name, company, serviceArea, specialties, rating, availability, notes } = req.body;
+        
+        await dbRun(`
+            INSERT OR REPLACE INTO contractors 
+            (phone_number, name, company, service_area, specialties, rating, availability, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, [phoneNumber, name, company, serviceArea, specialties, rating, availability, notes]);
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error adding contractor:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Dashboard endpoint
+app.get('/api/dashboard', async (req, res) => {
+    try {
+        console.log('=== DASHBOARD DEBUG START ===');
+        
+        const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
+        console.log('Total calls in DB:', totalCalls);
+        
+        const todayCalls = await dbGet(`
+            SELECT COUNT(*) as count FROM calls 
+            WHERE DATE(start_time) = DATE('now')
+        `);
+        console.log('Today calls:', todayCalls);
+        
+        const activeCalls = await dbGet(`
+            SELECT COUNT(*) as count FROM calls 
+            WHERE status = 'answered' OR status = 'initiated'
+        `);
+        console.log('Active calls:', activeCalls);
+        
+        const totalCustomers = await dbGet('SELECT COUNT(*) as count FROM customers');
+        const totalContractors = await dbGet('SELECT COUNT(*) as count FROM contractors');
+
+        // Also get recent calls for debugging
+        const recentCalls = await dbAll('SELECT * FROM calls ORDER BY start_time DESC LIMIT 10');
+        console.log('Recent calls for dashboard:', recentCalls);
+        
+        // Additional debug query to see what's different
+        const allCallsDebug = await dbAll('SELECT call_id, status, COUNT(*) as count FROM calls GROUP BY call_id, status');
+        console.log('All calls grouped debug:', allCallsDebug);
+        
+        console.log('=== DASHBOARD DEBUG END ===');
+
+        res.json({
+            totalCalls: totalCalls.count,
+            todayCalls: todayCalls.count,
+            activeCalls: activeCalls.count,
+            totalCustomers: totalCustomers.count,  
+            totalContractors: totalContractors.count
+        });
+    } catch (error) {
+        console.error('Error fetching dashboard data:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -1351,41 +1414,31 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Enhanced database debug endpoint
+// Database debug endpoint
 app.get('/api/debug/db', async (req, res) => {
     try {
-        const timestamp = new Date().toISOString();
-        console.log(`[telnyx-phone-system] [${timestamp}] Database debug endpoint called`);
+        console.log('Database debug endpoint called');
         
         // Test basic database connection
         const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
-        console.log(`[telnyx-phone-system] [${timestamp}] Total calls in DB:`, totalCalls);
+        console.log('Total calls in DB:', totalCalls);
         
         // Get all calls with all columns
         const allCalls = await dbAll('SELECT * FROM calls ORDER BY id DESC');
-        console.log(`[telnyx-phone-system] [${timestamp}] All calls in database:`, allCalls);
+        console.log('All calls in database:', allCalls);
         
         // Check table schema
         const schema = await dbAll("PRAGMA table_info(calls)");
-        console.log(`[telnyx-phone-system] [${timestamp}] Calls table schema:`, schema);
-        
-        // Check database file info
-        const dbInfo = {
-            path: dbPath,
-            queueLength: dbQueue.queue.length,
-            queueProcessing: dbQueue.processing,
-            operationCount: dbQueue.operationCount
-        };
+        console.log('Calls table schema:', schema);
         
         res.json({
             totalCalls: totalCalls.count,
             calls: allCalls,
             schema: schema,
-            dbInfo: dbInfo,
-            timestamp: timestamp
+            timestamp: new Date().toISOString()
         });
     } catch (error) {
-        console.error(`[telnyx-phone-system] Database debug error:`, error);
+        console.error('Database debug error:', error);
         res.status(500).json({ 
             error: error.message, 
             stack: error.stack,
@@ -1409,10 +1462,52 @@ app.get('/api/recordings', (req, res) => {
     }
 });
 
+// Configure human representative phone number
+app.post('/api/configure-human', async (req, res) => {
+    try {
+        const { phoneNumber } = req.body;
+        
+        if (!phoneNumber) {
+            return res.status(400).json({ error: 'Phone number is required' });
+        }
+        
+        // Validate phone number format (basic validation)
+        const phoneRegex = /^\+?1?[2-9]\d{2}[2-9]\d{2}\d{4}$/;
+        if (!phoneRegex.test(phoneNumber.replace(/\D/g, ''))) {
+            return res.status(400).json({ error: 'Invalid phone number format' });
+        }
+        
+        // In a production environment, you'd want to store this in database
+        // For now, we'll just confirm the environment variable should be set
+        console.log('Human representative phone number configured:', phoneNumber);
+        
+        res.json({ 
+            success: true, 
+            message: 'Human representative phone number configured successfully',
+            phoneNumber: phoneNumber,
+            note: 'Make sure to set HUMAN_PHONE_NUMBER environment variable to: ' + phoneNumber
+        });
+    } catch (error) {
+        console.error('Error configuring human phone number:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get current human representative configuration
+app.get('/api/human-config', (req, res) => {
+    const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER;
+    
+    res.json({
+        configured: !!humanPhoneNumber && humanPhoneNumber !== '+1234567890',
+        phoneNumber: humanPhoneNumber === '+1234567890' ? null : humanPhoneNumber,
+        status: humanPhoneNumber === '+1234567890' ? 'not_configured' : 'configured'
+    });
+});
+
 // Initialize and start server
 async function startServer() {
     try {
-        console.log('[telnyx-phone-system] Starting server initialization...');
+        console.log('Starting server initialization...');
         
         // Initialize database first
         await initDatabase();
@@ -1420,46 +1515,46 @@ async function startServer() {
         const PORT = process.env.PORT || 3000;
         
         const server = app.listen(PORT, '0.0.0.0', () => {
-            console.log(`[telnyx-phone-system] Telnyx Lead Generation System running on port ${PORT}`);
-            console.log(`[telnyx-phone-system] Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhooks/calls`);
-            console.log(`[telnyx-phone-system] Telnyx phone number: ${process.env.TELNYX_PHONE_NUMBER || 'Not set'}`);
-            console.log(`[telnyx-phone-system] Database path: ${dbPath}`);
-            console.log('[telnyx-phone-system] Server is ready to receive calls!');
+            console.log(`Telnyx Lead Generation System running on port ${PORT}`);
+            console.log(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhooks/calls`);
+            console.log(`Telnyx phone number: ${process.env.TELNYX_PHONE_NUMBER || 'Not set'}`);
+            console.log(`Database path: ${dbPath}`);
+            console.log('Server is ready to receive calls!');
         });
 
         // Handle graceful shutdown
         process.on('SIGTERM', () => {
-            console.log('[telnyx-phone-system] SIGTERM received, closing database and server...');
+            console.log('SIGTERM received, closing database and server...');
             db.close((err) => {
                 if (err) {
-                    console.error('[telnyx-phone-system] Error closing database:', err);
+                    console.error('Error closing database:', err);
                 } else {
-                    console.log('[telnyx-phone-system] Database connection closed.');
+                    console.log('Database connection closed.');
                 }
                 server.close(() => {
-                    console.log('[telnyx-phone-system] Server closed.');
+                    console.log('Server closed.');
                     process.exit(0);
                 });
             });
         });
 
         process.on('SIGINT', () => {
-            console.log('[telnyx-phone-system] SIGINT received, closing database and server...');
+            console.log('SIGINT received, closing database and server...');
             db.close((err) => {
                 if (err) {
-                    console.error('[telnyx-phone-system] Error closing database:', err);
+                    console.error('Error closing database:', err);
                 } else {
-                    console.log('[telnyx-phone-system] Database connection closed.');
+                    console.log('Database connection closed.');
                 }
                 server.close(() => {
-                    console.log('[telnyx-phone-system] Server closed.');
+                    console.log('Server closed.');
                     process.exit(0);
                 });
             });
         });
         
     } catch (error) {
-        console.error('[telnyx-phone-system] Failed to start server:', error);
+        console.error('Failed to start server:', error);
         process.exit(1);
     }
 }
