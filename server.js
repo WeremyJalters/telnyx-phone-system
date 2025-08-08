@@ -346,7 +346,7 @@ async function handleCallAnswered(data) {
 
         // Check if this is a human representative call (outbound call to human)
         if (existingCall.call_type === 'human_representative') {
-            console.log('Human representative answered, initiating bridge');
+            console.log('*** HUMAN REP CALL ANSWERED - initiating bridge process ***');
             await handleHumanRepresentativeAnswered(callId, existingCall);
         }
 
@@ -383,25 +383,29 @@ async function handleCallAnswered(data) {
 // Handle when human representative answers their phone
 async function handleHumanRepresentativeAnswered(humanCallId, humanCallRecord) {
     try {
-        console.log('Human representative answered call:', humanCallId);
+        console.log('*** HUMAN ANSWERED: Human call ID:', humanCallId, '***');
+        console.log('*** CURRENT PENDING MAP:', Array.from(pendingHumanCalls.entries()), '***');
         
         // Find the customer call waiting for this human
         let customerCallId = null;
         
         for (const [custId, humanId] of pendingHumanCalls) {
+            console.log('*** CHECKING: Customer', custId, 'mapped to Human', humanId, 'vs answered Human', humanCallId, '***');
             if (humanId === humanCallId) {
                 customerCallId = custId;
+                console.log('*** MATCH FOUND: Customer', customerCallId, 'waiting for Human', humanCallId, '***');
                 break;
             }
         }
         
         if (!customerCallId) {
-            console.error('No customer call found waiting for human:', humanCallId);
+            console.error('*** ERROR: No customer call found waiting for human:', humanCallId, '***');
+            console.error('*** PENDING CALLS MAP:', Array.from(pendingHumanCalls.entries()), '***');
             await speakToCall(humanCallId, "I apologize, there was a system error. No customer is waiting. Please hang up.");
             return;
         }
         
-        console.log('Found customer call waiting:', customerCallId, 'for human:', humanCallId);
+        console.log('*** BRIDGE SETUP: Customer', customerCallId, 'will be bridged to Human', humanCallId, '***');
         
         // Greet the human representative with context
         await speakToCall(humanCallId, "Hello, this is Weather Pro Solutions. You have a customer waiting on the line who needs roofing assistance. Connecting you now to the customer on a recorded line.");
@@ -409,7 +413,7 @@ async function handleHumanRepresentativeAnswered(humanCallId, humanCallRecord) {
         // Wait for greeting to finish, then bridge the calls
         setTimeout(async () => {
             try {
-                console.log('Bridging customer and human calls...');
+                console.log('*** INITIATING BRIDGE: Customer', customerCallId, '<-> Human', humanCallId, '***');
                 const bridgeResponse = await fetch(`https://api.telnyx.com/v2/calls/${customerCallId}/actions/bridge`, {
                     method: 'POST',
                     headers: {
@@ -423,10 +427,11 @@ async function handleHumanRepresentativeAnswered(humanCallId, humanCallRecord) {
                 });
 
                 if (bridgeResponse.ok) {
-                    console.log('Successfully bridged customer and human calls');
+                    console.log('*** BRIDGE SUCCESS: Customer and human calls connected! ***');
                     
                     // Remove from pending
                     pendingHumanCalls.delete(customerCallId);
+                    console.log('*** REMOVED FROM PENDING MAP. New map:', Array.from(pendingHumanCalls.entries()), '***');
                     
                     // Update call records
                     await dbRun(`
@@ -437,18 +442,18 @@ async function handleHumanRepresentativeAnswered(humanCallId, humanCallRecord) {
                     
                 } else {
                     const errorData = await bridgeResponse.text();
-                    console.error('Failed to bridge calls:', bridgeResponse.status, errorData);
+                    console.error('*** BRIDGE FAILED:', bridgeResponse.status, errorData, '***');
                     await speakToCall(humanCallId, "I apologize, there was a technical issue connecting you to the customer. Please hang up.");
                     await speakToCall(customerCallId, "I apologize, but we're having technical difficulties. Please call back in a few minutes.");
                 }
             } catch (bridgeError) {
-                console.error('Error during bridge operation:', bridgeError);
+                console.error('*** BRIDGE ERROR:', bridgeError, '***');
                 await speakToCall(humanCallId, "I apologize, there was a technical issue. Please hang up.");
             }
         }, 3000); // Give human rep 3 seconds to hear the greeting
         
     } catch (error) {
-        console.error('Error handling human representative answer:', error);
+        console.error('*** ERROR in handleHumanRepresentativeAnswered:', error, '***');
     }
 }
 
@@ -599,6 +604,7 @@ async function connectToHuman(callId) {
         const humanCallId = humanCall.data.call_control_id;
         
         console.log('Human representative call initiated:', humanCallId);
+        console.log('*** STORING PENDING RELATIONSHIP: Customer', callId, '-> Human', humanCallId, '***');
 
         // Store the human call record
         await dbRun(`
@@ -616,13 +622,15 @@ async function connectToHuman(callId) {
             `Calling representative for customer call ${callId}`
         ]);
 
-        // Track the relationship between customer and human calls
+        // Track the relationship between customer and human calls - CRITICAL!
         pendingHumanCalls.set(callId, humanCallId);
+        console.log('*** PENDING CALLS MAP NOW HAS:', Array.from(pendingHumanCalls.entries()), '***');
 
         // Set up a timeout to handle if human doesn't answer
         setTimeout(async () => {
+            console.log('*** TIMEOUT CHECK: Pending calls map:', Array.from(pendingHumanCalls.entries()), '***');
             if (pendingHumanCalls.has(callId)) {
-                console.log('Human representative did not answer within timeout');
+                console.log('Human representative did not answer within timeout for customer:', callId);
                 
                 // Hangup the human call attempt
                 try {
@@ -634,11 +642,14 @@ async function connectToHuman(callId) {
                             'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
                         }
                     });
+                    console.log('Hung up human call due to timeout:', humanCallId);
                 } catch (hangupError) {
                     console.error('Error hanging up human call:', hangupError);
                 }
                 
                 await handleHumanNoAnswer(callId);
+            } else {
+                console.log('*** TIMEOUT: Call', callId, 'no longer in pending map - likely already connected ***');
             }
         }, 35000); // 35 second timeout
 
