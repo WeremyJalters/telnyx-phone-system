@@ -542,7 +542,7 @@ async function connectToHuman(callId) {
         console.log('Connecting customer to human representative for call:', callId);
         
         // Configuration for human representative
-        const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER || '+1234567890'; // Replace with actual number
+        const humanPhoneNumber = process.env.HUMAN_PHONE_NUMBER || '+18609389491'; // Replace with actual number
         
         if (humanPhoneNumber === '+1234567890') {
             console.error('HUMAN_PHONE_NUMBER not configured in environment variables');
