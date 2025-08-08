@@ -578,6 +578,7 @@ async function connectToHuman(callId) {
             body: JSON.stringify({
                 to: humanPhoneNumber,
                 from: process.env.TELNYX_PHONE_NUMBER,
+                connection_id: "2755388541746808609",
                 webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls',
                 machine_detection: 'disabled',
                 timeout_secs: 30
