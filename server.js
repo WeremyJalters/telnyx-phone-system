@@ -3,27 +3,39 @@ import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import sqlite3 from 'sqlite3';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
-// ------------------------------------------------------------------
-// Paths / App
-// ------------------------------------------------------------------
+// ------------------------------------------------------
+// Setup
+// ------------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ------------------------------------------------------------------
-// Config for optional recorded prompts (DigitalOcean Spaces CDN URLs)
-// ------------------------------------------------------------------
+// Optional recorded prompts
 const USE_RECORDED_PROMPTS = String(process.env.USE_RECORDED_PROMPTS || 'false').toLowerCase() === 'true';
 const GREETING_AUDIO_URL = process.env.GREETING_AUDIO_URL || '';
 const MENU_AUDIO_URL = process.env.MENU_AUDIO_URL || '';
 const HUMAN_GREETING_AUDIO_URL = process.env.HUMAN_GREETING_AUDIO_URL || '';
 
-// ------------------------------------------------------------------
-// Simple single-thread DB queue + SQLite with WAL
-// ------------------------------------------------------------------
+// Spaces client (S3-compatible)
+const S3 = new S3Client({
+  region: process.env.SPACES_REGION || 'nyc3',
+  endpoint: `https://${process.env.SPACES_ENDPOINT || 'nyc3.digitaloceanspaces.com'}`,
+  forcePathStyle: false,
+  credentials: {
+    accessKeyId: process.env.SPACES_KEY || '',
+    secretAccessKey: process.env.SPACES_SECRET || ''
+  }
+});
+const SPACES_BUCKET = process.env.SPACES_BUCKET || '';
+const SPACES_CDN_BASE = process.env.SPACES_CDN_BASE || '';
+
+// ------------------------------------------------------
+// SQLite + simple queue
+// ------------------------------------------------------
 class DatabaseQueue {
   constructor() { this.q = []; this.processing = false; }
   execute(op) {
@@ -79,9 +91,7 @@ const dbGet = (sql, params = []) =>
     db.get(sql, params, (err, row) => err ? (console.error('DB GET error:', err, sql, params), rej(err)) : res(row));
   }));
 
-// ------------------------------------------------------------------
-// UPSERT helpers (call_id is unique key)
-// ------------------------------------------------------------------
+// UPSERT helpers using call_id as unique key
 async function upsertCall(call) {
   const cols = Object.keys(call);
   const placeholders = cols.map(() => '?').join(', ');
@@ -90,19 +100,15 @@ async function upsertCall(call) {
                ON CONFLICT(call_id) DO UPDATE SET ${updates}`;
   return dbRun(sql, cols.map(c => call[c]));
 }
-async function upsertFields(call_id, fields) {
-  return upsertCall({ call_id, ...fields });
-}
+async function upsertFields(call_id, fields) { return upsertCall({ call_id, ...fields }); }
 
-// ------------------------------------------------------------------
-// Express middleware
-// ------------------------------------------------------------------
+// ------------------------------------------------------
+// Express
+// ------------------------------------------------------
 app.use(express.json());
 app.use(express.static(join(__dirname, 'public')));
 
-// ------------------------------------------------------------------
-// Init DB schema
-// ------------------------------------------------------------------
+// DB schema
 async function initDatabase() {
   await dbRun(`
     CREATE TABLE IF NOT EXISTS calls (
@@ -161,20 +167,18 @@ async function initDatabase() {
   console.log('Existing calls in DB:', count?.count || 0);
 }
 
-// ------------------------------------------------------------------
-// In-memory state
-// ------------------------------------------------------------------
+// ------------------------------------------------------
+// Runtime state
+// ------------------------------------------------------
 const activeCalls = new Map();
 const pendingHumanCalls = new Map(); // customerCallId -> humanCallId
 
-// ------------------------------------------------------------------
-// Web pages
-// ------------------------------------------------------------------
+// ------------------------------------------------------
+// Routes
+// ------------------------------------------------------
 app.get('/', (req, res) => res.sendFile(join(__dirname, 'public', 'index.html')));
 
-// ------------------------------------------------------------------
 // Telnyx webhook
-// ------------------------------------------------------------------
 app.post('/webhooks/calls', async (req, res) => {
   const { data } = req.body || {};
   const event = data?.event_type;
@@ -196,9 +200,9 @@ app.post('/webhooks/calls', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// ------------------------------------------------------------------
-// Event handlers
-// ------------------------------------------------------------------
+// ------------------------------------------------------
+// Handlers
+// ------------------------------------------------------
 async function handleCallInitiated(data) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
   const dir = data.payload?.direction || data.direction;
@@ -208,24 +212,14 @@ async function handleCallInitiated(data) {
 
   if (dir === 'incoming') {
     await upsertCall({
-      call_id,
-      direction: 'inbound',
-      from_number,
-      to_number,
-      status: 'initiated',
-      start_time,
-      call_type: 'customer_inquiry'
+      call_id, direction: 'inbound', from_number, to_number,
+      status: 'initiated', start_time, call_type: 'customer_inquiry'
     });
     await answerAndIntro(call_id);
   } else {
     await upsertCall({
-      call_id,
-      direction: 'outbound',
-      from_number,
-      to_number,
-      status: 'initiated',
-      start_time,
-      call_type: 'human_representative',
+      call_id, direction: 'outbound', from_number, to_number,
+      status: 'initiated', start_time, call_type: 'human_representative',
       notes: 'Outbound leg to human'
     });
   }
@@ -251,16 +245,15 @@ async function handleCallHangup(data) {
   await upsertFields(call_id, { status: 'completed', end_time, duration });
   activeCalls.delete(call_id);
 
-  // If customer hung up while rep was ringing
+  // If customer hung up while rep ringing
   if (pendingHumanCalls.has(call_id)) {
     const humanId = pendingHumanCalls.get(call_id);
     pendingHumanCalls.delete(call_id);
     try {
       await fetch(`https://api.telnyx.com/v2/calls/${humanId}/actions/hangup`, {
-        method: 'POST',
-        headers: telnyxHeaders()
+        method: 'POST', headers: telnyxHeaders()
       });
-    } catch { /* ignore */ }
+    } catch {}
   }
 
   try {
@@ -271,13 +264,52 @@ async function handleCallHangup(data) {
   } catch (e) { console.error('hangup schedule zap error:', e); }
 }
 
-async function handleRecordingSaved(data) {
-  const call_id = data.payload?.call_control_id || data.call_control_id;
-  const recording_url = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
+// Mirror Telnyx temporary URL to Spaces, return permanent CDN URL
+async function mirrorRecordingToSpaces(call_id, telnyxUrl) {
+  if (!SPACES_BUCKET || !SPACES_CDN_BASE) {
+    console.warn('Spaces not fully configured; keeping Telnyx URL.');
+    return telnyxUrl;
+  }
 
   try {
+    const resp = await fetch(telnyxUrl);
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw new Error(`Download failed: ${resp.status} ${txt}`);
+    }
+
+    const arrayBuf = await resp.arrayBuffer();
+    const body = Buffer.from(arrayBuf);
+
+    const key = `recordings/${call_id}.mp3`;
+    const put = new PutObjectCommand({
+      Bucket: SPACES_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: 'audio/mpeg',
+      ACL: 'public-read',
+      CacheControl: 'public, max-age=31536000, immutable'
+    });
+    await S3.send(put);
+
+    const cdnUrl = `${SPACES_CDN_BASE.replace(/\/+$/,'')}/${key}`;
+    console.log('Uploaded recording to Spaces:', cdnUrl);
+    return cdnUrl;
+  } catch (err) {
+    console.error('mirrorRecordingToSpaces error:', err);
+    return telnyxUrl; // fallback (expires) so Zap still gets something
+  }
+}
+
+async function handleRecordingSaved(data) {
+  const call_id = data.payload?.call_control_id || data.call_control_id;
+  const telnyxRecordingUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
+
+  let finalRecordingUrl = telnyxRecordingUrl;
+  try {
     await dbRun('BEGIN IMMEDIATE');
-    await upsertFields(call_id, { recording_url });
+    finalRecordingUrl = await mirrorRecordingToSpaces(call_id, telnyxRecordingUrl);
+    await upsertFields(call_id, { recording_url: finalRecordingUrl });
     await dbRun('COMMIT');
   } catch (e) {
     console.error('recording upsert failed:', e);
@@ -319,9 +351,9 @@ async function handleDTMF(data) {
   }
 }
 
-// ------------------------------------------------------------------
-// Telnyx helpers
-// ------------------------------------------------------------------
+// ------------------------------------------------------
+// Telnyx helper funcs
+// ------------------------------------------------------
 function telnyxHeaders() {
   return {
     'Content-Type': 'application/json',
@@ -329,6 +361,7 @@ function telnyxHeaders() {
     'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
   };
 }
+
 async function answerAndIntro(callId) {
   try {
     const answer = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
@@ -336,18 +369,15 @@ async function answerAndIntro(callId) {
     });
     if (!answer.ok) { console.error('Failed to answer:', await answer.text()); return; }
 
-    // start recording
     await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
       method: 'POST', headers: telnyxHeaders(),
       body: JSON.stringify({ format: 'mp3', channels: 'dual' })
     }).catch(() => {});
 
-    // optional recorded greeting
     if (USE_RECORDED_PROMPTS && GREETING_AUDIO_URL) {
       await playbackAudio(callId, GREETING_AUDIO_URL);
       await waitMs(800);
     }
-
     await playIVRMenu(callId);
   } catch (e) { console.error('answerAndIntro error:', e); }
 }
@@ -405,7 +435,6 @@ async function connectToHuman(customerCallId) {
 
     await upsertFields(customerCallId, { call_type: 'human_transfer', notes: 'Customer transferred to human representative' });
 
-    // short notice to caller
     await speakToCall(customerCallId, "Connecting you now. Please remain on the line while we dial our representative.");
     await waitMs(400);
 
@@ -440,7 +469,6 @@ async function connectToHuman(customerCallId) {
     });
     pendingHumanCalls.set(customerCallId, humanCallId);
 
-    // timeout if rep doesn't answer
     setTimeout(async () => {
       if (pendingHumanCalls.has(customerCallId)) {
         try {
@@ -456,15 +484,13 @@ async function connectToHuman(customerCallId) {
   }
 }
 
-async function handleHumanRepresentativeAnswered(humanCallId, record) {
-  // map back to the customer leg waiting on this rep
+async function handleHumanRepresentativeAnswered(humanCallId) {
   let customerCallId = null;
   for (const [custId, humanId] of pendingHumanCalls) {
     if (humanId === humanCallId) { customerCallId = custId; break; }
   }
   if (!customerCallId) { await speakToCall(humanCallId, "Sorry, no customer is waiting. Please hang up."); return; }
 
-  // optional rep greeting
   if (USE_RECORDED_PROMPTS && HUMAN_GREETING_AUDIO_URL) {
     await playbackAudio(humanCallId, HUMAN_GREETING_AUDIO_URL);
     await waitMs(1500);
@@ -492,10 +518,9 @@ async function handleHumanNoAnswer(callId) {
   await gatherUsingSpeak(callId, "Please leave your message now. Press pound when finished.", { min: 0, max: 0, timeoutMs: 60000, term: '#' });
 }
 
-// ------------------------------------------------------------------
-// Zapier / Airtable webhook
-// (KEEPING KEYS THE SAME to avoid breaking your current Zap)
-// ------------------------------------------------------------------
+// ------------------------------------------------------
+// Zapier webhook (payload keys unchanged)
+// ------------------------------------------------------
 async function scheduleZapierWebhook(callId) {
   try {
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
@@ -518,11 +543,10 @@ async function sendToZapier(callId) {
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
     if (!call) { console.error('sendToZapier: call not found', callId); return; }
 
-    // IMPORTANT: these keys match what your Zap is already using
     const payload = {
       call_id: call.call_id,
       timestamp: new Date().toISOString(),
-      customer_phone: call.from_number,       // <-- keep
+      customer_phone: call.from_number,
       customer_name: call.customer_name || 'Name collected during call',
       customer_zip_code: call.customer_zip_code || 'Zip code collected during call',
       call_duration_seconds: call.duration || 0,
@@ -530,7 +554,7 @@ async function sendToZapier(callId) {
       call_end_time: call.end_time,
       call_type: call.call_type,
       call_status: call.status,
-      recording_url: call.recording_url,      // <-- keep
+      recording_url: call.recording_url, // now permanent Spaces CDN link
       transcript: call.transcript,
       lead_quality: call.lead_quality || 'To be determined',
       notes: call.notes || '',
@@ -559,9 +583,9 @@ async function sendToZapier(callId) {
   }
 }
 
-// ------------------------------------------------------------------
-// API for outbound calls and UI
-// ------------------------------------------------------------------
+// ------------------------------------------------------
+// Misc API for your UI
+// ------------------------------------------------------
 app.post('/api/call-customer', async (req, res) => {
   try {
     const { customerNumber } = req.body;
@@ -611,44 +635,6 @@ app.post('/api/call-contractor', async (req, res) => {
   } catch (e) { console.error('Error making contractor call:', e); res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/three-way-call', async (req, res) => {
-  try {
-    const { customerNumber, contractorNumber } = req.body;
-    const mk = async (to) => {
-      const rr = await fetch('https://api.telnyx.com/v2/calls', {
-        method: 'POST', headers: telnyxHeaders(),
-        body: JSON.stringify({ to, from: process.env.TELNYX_PHONE_NUMBER, webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls' })
-      });
-      if (!rr.ok) throw new Error(`Failed to create call to ${to}: ${rr.status}`);
-      return rr.json();
-    };
-    const customerCall = await mk(customerNumber);
-    const contractorCall = await mk(contractorNumber);
-    res.json({ success: true, customerCallId: customerCall.data.call_control_id, contractorCallId: contractorCall.data.call_control_id });
-  } catch (e) { console.error('Error creating three-way call:', e); res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/calls/:callId/update-customer-info', async (req, res) => {
-  try {
-    const { callId } = req.params;
-    const { customerName, zipCode, leadQuality, notes } = req.body;
-    await upsertFields(callId, { customer_name: customerName, customer_zip_code: zipCode, lead_quality: leadQuality, notes });
-    const updated = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-    if (updated && updated.status === 'completed' && updated.recording_url && !updated.zapier_sent) await scheduleZapierWebhook(callId);
-    res.json({ success: true });
-  } catch (e) { console.error('Error updating customer info:', e); res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/calls/:callId/send-to-zapier', async (req, res) => {
-  try {
-    const { callId } = req.params;
-    const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-    if (!call) return res.status(404).json({ error: 'Call not found' });
-    await sendToZapier(callId);
-    res.json({ success: true, message: 'Zapier webhook triggered' });
-  } catch (e) { console.error('Manual Zap error:', e); res.status(500).json({ error: e.message }); }
-});
-
 app.get('/api/calls', async (req, res) => {
   try {
     const { limit = 50, offset = 0, type } = req.query;
@@ -671,23 +657,13 @@ app.get('/api/calls/:callId', async (req, res) => {
   } catch (e) { console.error('GET call details error:', e); res.status(500).json({ error: e.message }); }
 });
 
-// Simple stats
-app.get('/api/stats', async (req, res) => {
-  try {
-    const totalCalls = await dbGet('SELECT COUNT(*) as count FROM calls');
-    const withRecordings = await dbGet('SELECT COUNT(*) as count FROM calls WHERE recording_url IS NOT NULL');
-    const completed = await dbGet(`SELECT COUNT(*) as count FROM calls WHERE status='completed'`);
-    res.json({ totalCalls: totalCalls?.count || 0, withRecordings: withRecordings?.count || 0, completed: completed?.count || 0 });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString(), port: PORT, nodeVersion: process.version });
 });
 
-// ------------------------------------------------------------------
+// ------------------------------------------------------
 // Boot
-// ------------------------------------------------------------------
+// ------------------------------------------------------
 function waitMs(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function startServer() {
@@ -698,12 +674,9 @@ async function startServer() {
       console.log(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhooks/calls`);
       console.log(`Telnyx number: ${process.env.TELNYX_PHONE_NUMBER || 'Not set'}`);
       console.log(`Human number: ${process.env.HUMAN_PHONE_NUMBER || 'Not set'}`);
+      console.log(`Spaces bucket: ${SPACES_BUCKET || '(not set)'}`);
+      console.log(`Spaces CDN base: ${SPACES_CDN_BASE || '(not set)'}`);
       console.log(`Recorded prompts enabled: ${USE_RECORDED_PROMPTS}`);
-      if (USE_RECORDED_PROMPTS) {
-        console.log(`GREETING_AUDIO_URL: ${GREETING_AUDIO_URL || '(none)'}`);
-        console.log(`MENU_AUDIO_URL: ${MENU_AUDIO_URL || '(none)'}`);
-        console.log(`HUMAN_GREETING_AUDIO_URL: ${HUMAN_GREETING_AUDIO_URL || '(none)'}`);
-      }
       console.log(`Database path: ${dbPath}`);
     });
 
