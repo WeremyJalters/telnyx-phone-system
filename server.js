@@ -453,7 +453,7 @@ async function handleHumanRepresentativeAnswered(humanCallId, humanCallRecord) {
         console.log('*** BRIDGE SETUP: Customer', customerCallId, 'will be bridged to Human', humanCallId, '***');
         
         // Greet the human representative with context
-        await speakToCall(humanCallId, "Hello, this is Weather Pro Solutions. You have a customer waiting on the line who needs roofing assistance. Connecting you now to the customer on a recorded line.");
+        await speakToCall(humanCallId, "Hello, this is Weather Pro Solutions. You have a customer waiting on the line who needs flood assistance. Connecting you now to the customer on a recorded line.");
         
         // Wait for greeting to finish, then bridge the calls
         setTimeout(async () => {
@@ -575,7 +575,7 @@ async function collectCustomerInfo(callId) {
                 'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
             },
             body: JSON.stringify({
-                payload: "Please describe your roofing project or issue after the beep. Include your address and type of service needed. Press pound when finished.",
+                payload: "Please describe your water damage issue after the beep. Include your address and type of service needed. Press pound when finished.",
                 voice: 'female',
                 language: 'en-US',
                 minimum_digits: 0,
@@ -716,7 +716,7 @@ async function handleHumanNoAnswer(callId) {
         pendingHumanCalls.delete(callId);
         
         // Speak to the customer with options
-        await speakToCall(callId, "I apologize, but our representative is currently unavailable. Please leave a detailed message about your roofing needs and we'll call you back within one hour. You can also call us directly during business hours, Monday through Friday, 8 AM to 6 PM. Please start your message after the beep.");
+        await speakToCall(callId, "I apologize, but our representative is currently unavailable. Please leave a detailed message about your flood restoration needs and we'll call you back within one hour. You can also call us directly during business hours, Monday through Friday, 8 AM to 6 PM. Please start your message after the beep.");
         
         // Set up message recording
         setTimeout(async () => {
@@ -728,7 +728,7 @@ async function handleHumanNoAnswer(callId) {
                     'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
                 },
                 body: JSON.stringify({
-                    payload: "Please leave your message now. Include your name, phone number, address, and details about your roofing needs. Press pound when finished.",
+                    payload: "Please leave your message now. Include your name, phone number, address, and details about your flood restoration needs. Press pound when finished.",
                     voice: 'female',
                     language: 'en-US',
                     minimum_digits: 0,
@@ -755,7 +755,7 @@ async function playIVRMenu(callId) {
                 'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
             },
             body: JSON.stringify({
-                payload: "Thank you for calling Weather Pro Solutions, your trusted roofing and exterior specialists. If you need to speak with a representative immediately, press 1. For general inquiries about roofing, siding, or gutters, press 2. To speak with a representative, press 0.",
+                payload: "Thank you for calling Weather Pro Solutions, your trusted water damage and flood recovery specialists. If you need to speak with a representative immediately, press 1. For general inquiries  press 2. To speak with a representative, press 0.",
                 voice: 'female',
                 language: 'en-US',
                 minimum_digits: 1,
