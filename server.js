@@ -14,20 +14,20 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// -----------------------------
-// Optional recorded prompts
-// -----------------------------
+/* -----------------------------
+   Optional recorded prompts
+----------------------------- */
 const USE_RECORDED_PROMPTS = String(process.env.USE_RECORDED_PROMPTS || 'false').toLowerCase() === 'true';
 const GREETING_AUDIO_URL = process.env.GREETING_AUDIO_URL || '';
 const MENU_AUDIO_URL = process.env.MENU_AUDIO_URL || '';
 const HUMAN_GREETING_AUDIO_URL = process.env.HUMAN_GREETING_AUDIO_URL || '';
 
-// -----------------------------
-// DigitalOcean Spaces (S3 compatible)
-// -----------------------------
-const SPACES_REGION = process.env.SPACES_REGION || 'nyc3';
+/* -----------------------------
+   DigitalOcean Spaces (S3)
+----------------------------- */
+const SPACES_REGION   = process.env.SPACES_REGION   || 'nyc3';
 const SPACES_ENDPOINT = process.env.SPACES_ENDPOINT || 'nyc3.digitaloceanspaces.com';
-const SPACES_BUCKET = process.env.SPACES_BUCKET || '';
+const SPACES_BUCKET   = process.env.SPACES_BUCKET   || '';
 const SPACES_CDN_BASE = (process.env.SPACES_CDN_BASE || '').replace(/\/+$/, '');
 
 const S3 = new S3Client({
@@ -40,9 +40,9 @@ const S3 = new S3Client({
   }
 });
 
-// -----------------------------
-// DB (sqlite3) + small write queue
-// -----------------------------
+/* -----------------------------
+   DB (sqlite3) + small write queue
+----------------------------- */
 class DatabaseQueue {
   constructor() { this.q = []; this.processing = false; }
   execute(op) {
@@ -128,9 +128,9 @@ async function initDatabase() {
   console.log('Existing calls in DB:', count?.count || 0);
 }
 
-// -----------------------------
-// UPSERT helpers
-// -----------------------------
+/* -----------------------------
+   UPSERT helpers
+----------------------------- */
 async function upsertCall(obj) {
   const cols = Object.keys(obj);
   const placeholders = cols.map(() => '?').join(', ');
@@ -141,19 +141,29 @@ async function upsertCall(obj) {
 }
 async function upsertFields(call_id, fields) { return upsertCall({ call_id, ...fields }); }
 
-// -----------------------------
-// App + state
-// -----------------------------
+/* -----------------------------
+   App + state
+----------------------------- */
 app.use(express.json());
 app.use(express.static(join(__dirname, 'public')));
 
 const activeCalls = new Map();
 const pendingByCustomer = new Map(); // customerCallId -> humanCallId
-const pendingByHuman = new Map();    // humanCallId   -> customerCallId
+const pendingByHuman    = new Map(); // humanCallId    -> customerCallId
 
-// -----------------------------
-// Telnyx helpers
-// -----------------------------
+// Extra: a tiny “wait for mapping” helper to kill races
+async function waitForMapping(humanCallId, maxMs = 5000, stepMs = 150) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (pendingByHuman.has(humanCallId)) return pendingByHuman.get(humanCallId);
+    await waitMs(stepMs);
+  }
+  return null;
+}
+
+/* -----------------------------
+   Telnyx helpers
+----------------------------- */
 function telnyxHeaders() {
   return {
     'Content-Type': 'application/json',
@@ -166,7 +176,7 @@ const TELNYX_PHONE_NUMBER = process.env.TELNYX_PHONE_NUMBER || '';
 
 function waitMs(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Answer + start recording + menu
+/* IVR / speaking / gather */
 async function answerAndIntro(callId) {
   try {
     const answer = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
@@ -174,7 +184,6 @@ async function answerAndIntro(callId) {
     });
     if (!answer.ok) { console.error('Failed to answer:', await answer.text()); return; }
 
-    // start recording
     await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
       method: 'POST', headers: telnyxHeaders(),
       body: JSON.stringify({ format: 'mp3', channels: 'dual' })
@@ -231,9 +240,9 @@ async function gatherUsingAudio(callId, audioUrl, { min = 1, max = 1, timeoutMs 
   if (!r.ok) console.error('gather_using_audio failed:', await r.text());
 }
 
-// -----------------------------
-// Spaces helpers
-// -----------------------------
+/* -----------------------------
+   Spaces helpers
+----------------------------- */
 async function uploadToSpaces({ key, body, contentType, acl = 'public-read', cache = 'public, max-age=31536000, immutable' }) {
   await S3.send(new PutObjectCommand({
     Bucket: SPACES_BUCKET,
@@ -264,9 +273,9 @@ async function mirrorRecordingToSpaces(call_id, telnyxUrl) {
   }
 }
 
-// -----------------------------
-// AssemblyAI transcription (async pipeline)
-// -----------------------------
+/* -----------------------------
+   AssemblyAI transcription (async)
+----------------------------- */
 const ASSEMBLY_KEY = process.env.ASSEMBLYAI_API_KEY || '';
 
 async function startAssemblyJob(audioUrl) {
@@ -323,9 +332,9 @@ async function transcribeAndUpload({ call_id, recordingUrl }) {
   }
 }
 
-// -----------------------------
-// Zapier
-// -----------------------------
+/* -----------------------------
+   Zapier
+----------------------------- */
 const ZAP_URL = process.env.ZAPIER_WEBHOOK_URL || '';
 console.log('Zapier webhook configured:', Boolean(ZAP_URL), ZAP_URL ? `(${ZAP_URL.slice(0, 20)}…${ZAP_URL.slice(-7)}/)` : '');
 
@@ -340,7 +349,6 @@ async function sendToZapier(callId) {
       call.status === 'completed' &&
       !!call.recording_url;
 
-    // Helpful debug
     console.log('ZAPIER DECISION →', {
       call_id: call.call_id,
       direction: call.direction,
@@ -353,9 +361,7 @@ async function sendToZapier(callId) {
 
     if (!shouldSend) return;
 
-    // Payload with BOTH friendly & snake_case keys
     const payload = {
-      // snake_case (technical)
       call_id: call.call_id,
       timestamp: new Date().toISOString(),
       customer_phone: call.from_number,
@@ -370,7 +376,7 @@ async function sendToZapier(callId) {
       lead_source: 'Inbound Phone Call',
       business_phone: call.to_number,
 
-      // Friendly duplicates (to avoid breaking existing Zap mappings)
+      // Friendly duplicates (keeps your Zap working)
       'Caller Phone': call.from_number,
       'Recording URL': call.recording_url,
       'Transcript URL': call.transcript_url || ''
@@ -390,37 +396,35 @@ async function sendToZapier(callId) {
     if (r.ok) {
       await upsertFields(callId, { zapier_sent: true, zapier_sent_at: new Date().toISOString() });
     } else {
-      // retry once in 30s
       setTimeout(() => sendToZapier(callId).catch(() => {}), 30000);
     }
   } catch (e) {
     console.error('sendToZapier error:', e);
-    // retry in 60s
     setTimeout(() => sendToZapier(callId).catch(() => {}), 60000);
   }
 }
 
-// -----------------------------
-// Webhook
-// -----------------------------
+/* -----------------------------
+   Webhook
+----------------------------- */
 app.post('/webhooks/calls', async (req, res) => {
   const { data } = req.body || {};
   const event = data?.event_type;
   const callId = data?.payload?.call_control_id || data?.call_control_id;
   console.log('Webhook:', event, 'CallID:', callId);
-  // Always ACK quickly so Telnyx doesn't retry
+  // ACK quickly
   res.status(200).send('OK');
 
   try {
     switch (event) {
-      case 'call.initiated': await handleCallInitiated(data); break;
-      case 'call.answered': await handleCallAnswered(data); break;
-      case 'call.hangup': await handleCallHangup(data); break;
-      case 'call.recording.saved': await handleRecordingSaved(data); break;
-      case 'call.dtmf.received': await handleDTMF(data); break;
-      case 'call.bridged': console.log('Telnyx confirms bridge for:', callId); break;
+      case 'call.initiated':        await handleCallInitiated(data); break;
+      case 'call.answered':         await handleCallAnswered(data);  break;
+      case 'call.hangup':           await handleCallHangup(data);    break;
+      case 'call.recording.saved':  await handleRecordingSaved(data); break;
+      case 'call.dtmf.received':    await handleDTMF(data);          break;
+      case 'call.bridged':          console.log('Telnyx confirms bridge for:', callId); break;
 
-      // noise we can ignore
+      // noise
       case 'call.speak.started':
       case 'call.speak.ended':
       case 'call.gather.ended':
@@ -431,12 +435,12 @@ app.post('/webhooks/calls', async (req, res) => {
   } catch (e) { console.error('Webhook error:', e); }
 });
 
-// -----------------------------
-// Handlers
-// -----------------------------
+/* -----------------------------
+   Handlers
+----------------------------- */
 async function handleCallInitiated(data) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
-  const dir = data.payload?.direction || data.direction;
+  const dir = data.payload?.direction || data.direction; // usually 'incoming' on inbound
   const from_number = data.payload?.from || data.from;
   const to_number = data.payload?.to || data.to;
   const start_time = new Date().toISOString();
@@ -460,8 +464,18 @@ async function handleCallAnswered(data) {
   await upsertFields(call_id, { status: 'answered' });
 
   const existing = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-  const isRepLeg = pendingByHuman.has(call_id) || existing?.call_type === 'human_representative';
-  if (isRepLeg) await handleHumanRepresentativeAnswered(call_id);
+  const looksLikeRepLeg = existing?.call_type === 'human_representative' || pendingByHuman.has(call_id);
+
+  if (looksLikeRepLeg) {
+    await handleHumanRepresentativeAnswered(call_id);
+  } else {
+    // If we *think* it might be the rep but mapping isn't ready yet, wait briefly and try again.
+    const customerIdLate = await waitForMapping(call_id, 5000, 150);
+    if (customerIdLate) {
+      console.log('Late mapping found for human leg; proceeding to bridge. human:', call_id, 'customer:', customerIdLate);
+      await handleHumanRepresentativeAnswered(call_id);
+    }
+  }
 
   activeCalls.set(call_id, { status: 'active', startTime: new Date(), participants: 1 });
 }
@@ -489,7 +503,6 @@ async function handleRecordingSaved(data) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
   const telnyxUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
 
-  // 1) Mirror recording to Spaces + save URL
   let finalRecordingUrl = telnyxUrl;
   try {
     await dbRun('BEGIN IMMEDIATE');
@@ -500,7 +513,7 @@ async function handleRecordingSaved(data) {
     try { await dbRun('ROLLBACK'); } catch {}
   }
 
-  // 2) Kick off transcription asynchronously; when done, save, then send to Zapier
+  // async pipeline: transcription + Zap
   (async () => {
     let transcriptUrl = null;
     let transcriptText = null;
@@ -514,11 +527,9 @@ async function handleRecordingSaved(data) {
     if (transcriptUrl) {
       await upsertFields(call_id, { transcript: transcriptText, transcript_url: transcriptUrl });
     } else {
-      // Set a placeholder so Zap has a value even if transcription fails
       await upsertFields(call_id, { transcript: 'Transcript unavailable', transcript_url: '' });
     }
 
-    // If the call already ended, push to Zapier now.
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
     if (call?.status === 'completed' && call?.recording_url) {
       await sendToZapier(call_id);
@@ -545,9 +556,9 @@ async function handleDTMF(data) {
   }
 }
 
-// -----------------------------
-// Human call leg / bridging
-// -----------------------------
+/* -----------------------------
+   Human call leg / bridging
+----------------------------- */
 async function connectToHuman(customerCallId) {
   try {
     if (!HUMAN_PHONE_NUMBER) {
@@ -558,7 +569,7 @@ async function connectToHuman(customerCallId) {
     await upsertFields(customerCallId, { call_type: 'human_transfer', notes: 'Customer transferred to human representative' });
 
     await speakToCall(customerCallId, "Connecting you now. Please remain on the line while we dial our representative.");
-    await waitMs(300);
+    await waitMs(200);
 
     const resp = await fetch('https://api.telnyx.com/v2/calls', {
       method: 'POST',
@@ -580,6 +591,7 @@ async function connectToHuman(customerCallId) {
     const json = await resp.json();
     const humanCallId = json.data.call_control_id;
 
+    // Insert human leg into DB first…
     await upsertCall({
       call_id: humanCallId,
       direction: 'outbound',
@@ -591,13 +603,15 @@ async function connectToHuman(customerCallId) {
       notes: `Calling representative for customer call ${customerCallId}`
     });
 
+    // …then immediately set the in-memory mapping (race-proofed by waitForMapping fallback).
     pendingByCustomer.set(customerCallId, humanCallId);
     pendingByHuman.set(humanCallId, customerCallId);
 
-    // ring timeout
+    // safety timeout: if still ringing after 35s, bail out
     setTimeout(async () => {
       if (pendingByCustomer.has(customerCallId)) {
         const humanId = pendingByCustomer.get(customerCallId);
+        console.log('Human leg timeout; hanging up human and asking customer to leave VM. human:', humanId);
         try {
           await fetch(`https://api.telnyx.com/v2/calls/${humanId}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() });
         } catch {}
@@ -613,18 +627,25 @@ async function connectToHuman(customerCallId) {
 }
 
 async function handleHumanRepresentativeAnswered(humanCallId) {
-  const customerCallId = pendingByHuman.get(humanCallId);
+  // Try fast path
+  let customerCallId = pendingByHuman.get(humanCallId);
   if (!customerCallId) {
-    await speakToCall(humanCallId, "Sorry, there was a system error. No customer is waiting. Please hang up.");
+    // Race fallback: wait up to 5s for mapping to appear
+    customerCallId = await waitForMapping(humanCallId, 5000, 150);
+  }
+
+  if (!customerCallId) {
+    console.warn('Human answered but no customer mapping found after wait. human:', humanCallId);
+    await speakToCall(humanCallId, "A customer just disconnected. Sorry for the inconvenience.");
     return;
   }
 
   if (USE_RECORDED_PROMPTS && HUMAN_GREETING_AUDIO_URL) {
     await playbackAudio(humanCallId, HUMAN_GREETING_AUDIO_URL);
-    await waitMs(1200);
+    await waitMs(900);
   } else {
     await speakToCall(humanCallId, "A customer is waiting on the line. Connecting you now on a recorded line.");
-    await waitMs(600);
+    await waitMs(400);
   }
 
   const bridge = await fetch(`https://api.telnyx.com/v2/calls/${customerCallId}/actions/bridge`, {
@@ -632,10 +653,12 @@ async function handleHumanRepresentativeAnswered(humanCallId) {
   });
 
   if (bridge.ok) {
+    console.log('Bridge requested. customer:', customerCallId, 'human:', humanCallId);
     pendingByHuman.delete(humanCallId);
     pendingByCustomer.delete(customerCallId);
     await upsertFields(customerCallId, { call_type: 'human_connected', notes: 'Successfully connected to human representative' });
   } else {
+    console.error('Bridge failed:', await bridge.text());
     await speakToCall(humanCallId, "I’m sorry, there was a technical issue connecting you to the customer.");
     await speakToCall(customerCallId, "We’re having technical difficulties. Please call back in a few minutes.");
   }
@@ -645,15 +668,15 @@ async function handleHumanNoAnswer(callId) {
   await speakToCall(callId, "I’m sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep. When you're done, you can hang up.");
 }
 
-// -----------------------------
-// Simple UI endpoints
-// -----------------------------
+/* -----------------------------
+   Simple UI endpoints
+----------------------------- */
 app.get('/', (req, res) => res.sendFile(join(__dirname, 'public', 'index.html')));
 app.get('/health', (req, res) => res.json({ status: 'healthy', timestamp: new Date().toISOString(), port: PORT, nodeVersion: process.version }));
 
-// -----------------------------
-// Start
-// -----------------------------
+/* -----------------------------
+   Start
+----------------------------- */
 async function startServer() {
   try {
     await initDatabase();
