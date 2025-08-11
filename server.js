@@ -901,13 +901,15 @@ async function scheduleZapierWebhook(callId) {
     console.log(`   - recording_url: ${call?.recording_url ? 'exists' : 'missing'}`);
     console.log(`   - zapier_sent: ${call?.zapier_sent}`);
     
+    // *** FIXED: More comprehensive check for customer calls ***
     const shouldSend =
-      (call?.call_type === 'customer_inquiry' || 
-       call?.call_type === 'human_connected' || 
-       call?.call_type === 'human_transfer') &&  // ⭐ Added human_transfer to trigger sending
       call?.status === 'completed' &&
       call?.recording_url &&
-      !call?.zapier_sent;
+      !call?.zapier_sent &&
+      (call?.direction === 'inbound' || 
+       call?.call_type === 'customer_inquiry' || 
+       call?.call_type === 'human_connected' || 
+       call?.call_type === 'human_transfer');
       
     console.log('ZAPIER DECISION →', {
       call_id: callId,
@@ -924,15 +926,25 @@ async function scheduleZapierWebhook(callId) {
       return;
     }
     
+    console.log(`✅ ZAPIER SCHEDULED: Will send webhook for ${callId} in 3 seconds`);
     setTimeout(async () => { await sendToZapier(callId); }, 3000);
-  } catch (e) { console.error('scheduleZapierWebhook error:', e); }
+  } catch (e) { 
+    console.error('scheduleZapierWebhook error:', e); 
+  }
 }
 
 async function sendToZapier(callId) {
   try {
-    if (!ZAPIER_WEBHOOK_URL) return;
+    if (!ZAPIER_WEBHOOK_URL) {
+      console.log(`❌ ZAPIER SKIP: No webhook URL configured`);
+      return;
+    }
+    
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-    if (!call) return;
+    if (!call) {
+      console.log(`❌ ZAPIER SKIP: Call ${callId} not found in database`);
+      return;
+    }
 
     const payload = {
       call_id: call.call_id,
@@ -951,16 +963,32 @@ async function sendToZapier(callId) {
     };
 
     console.log('ZAPIER SEND →', `(${ZAPIER_WEBHOOK_URL ? ZAPIER_WEBHOOK_URL.slice(0, 25) + '…' : ''}`, ')', payload);
+    
+    const startTime = Date.now();
     const r = await fetch(ZAPIER_WEBHOOK_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+      method: 'POST', 
+      headers: { 'Content-Type': 'application/json' }, 
+      body: JSON.stringify(payload),
+      timeout: 30000  // 30 second timeout
     });
+    const endTime = Date.now();
+    
     const bodyText = await r.text();
-    console.log('ZAPIER RESP →', 'status:', r.status, 'body:', bodyText);
+    console.log(`ZAPIER RESP → status: ${r.status}, time: ${endTime - startTime}ms, body: ${bodyText}`);
 
-    if (r.ok) await upsertFields(callId, { zapier_sent: true, zapier_sent_at: new Date().toISOString() });
-    else setTimeout(async () => { await sendToZapier(callId); }, 30000);
+    if (r.ok) {
+      await upsertFields(callId, { 
+        zapier_sent: true, 
+        zapier_sent_at: new Date().toISOString() 
+      });
+      console.log(`✅ ZAPIER SUCCESS: Webhook sent and database updated for ${callId}`);
+    } else {
+      console.log(`❌ ZAPIER FAILED: Will retry in 30 seconds for ${callId}`);
+      setTimeout(async () => { await sendToZapier(callId); }, 30000);
+    }
   } catch (e) {
-    console.error('sendToZapier error:', e);
+    console.error(`💥 ZAPIER ERROR for ${callId}:`, e);
+    console.log(`🔄 ZAPIER RETRY: Will retry in 60 seconds for ${callId}`);
     setTimeout(async () => { await sendToZapier(callId); }, 60000);
   }
 }
