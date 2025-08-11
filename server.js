@@ -11,7 +11,7 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- Optional recorded prompts (you can enable later) ---
+// --- Optional recorded prompts (can enable later) ---
 const USE_RECORDED_PROMPTS = String(process.env.USE_RECORDED_PROMPTS || 'false').toLowerCase() === 'true';
 const GREETING_AUDIO_URL = process.env.GREETING_AUDIO_URL || '';
 const MENU_AUDIO_URL = process.env.MENU_AUDIO_URL || '';
@@ -445,6 +445,54 @@ async function handleHumanNoAnswer(callId) {
   await speakToCall(callId, "I’m sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep. When you're done, you can hang up.");
 }
 
+// --- Helpers for Zap payload ---
+function titleCase(s) {
+  if (!s) return s;
+  return s.replace(/_/g, ' ').replace(/\w\S*/g, w => w[0].toUpperCase() + w.slice(1));
+}
+function formatNANP(e164) {
+  // Keep it super safe: only format +1XXXXXXXXXX; otherwise return as-is
+  const m = /^\+1(\d{10})$/.exec(e164 || '');
+  if (!m) return e164;
+  const d = m[1];
+  return `+1 (${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+}
+function buildZapPayload(call) {
+  // Original keys (back-compat with your working Zap)
+  const original = {
+    call_id: call.call_id,
+    timestamp: new Date().toISOString(),
+    customer_phone: call.from_number,
+    call_duration_seconds: call.duration || 0,
+    call_start_time: call.start_time,
+    call_end_time: call.end_time,
+    call_type: call.call_type,
+    call_status: call.status,
+    recording_url: call.recording_url,
+    source: 'Water Damage Restoration Phone System',
+    lead_source: 'Inbound Phone Call',
+    business_phone: call.to_number
+  };
+
+  // Friendly duplicates (for Airtable clarity)
+  const friendly = {
+    'Call ID': call.call_id,
+    'Customer Phone': formatNANP(call.from_number),
+    'Business Phone': formatNANP(call.to_number),
+    'Recording URL': call.recording_url,
+    'Type': titleCase(call.call_type || ''),
+    'Status': titleCase(call.status || ''),
+    'Duration (sec)': call.duration || 0,
+    'Start Time': call.start_time,
+    'End Time': call.end_time,
+    'Source': 'Water Damage Restoration Phone System',
+    'Lead Source': 'Inbound Phone Call'
+  };
+
+  // Merge (friendly keys won’t overwrite originals)
+  return { ...original, ...friendly };
+}
+
 // --- Zapier (broadened condition + stronger logging) ---
 async function scheduleZapierWebhook(callId) {
   try {
@@ -455,7 +503,6 @@ async function scheduleZapierWebhook(callId) {
       call.status === 'completed' &&
       !!call.recording_url &&
       !call.zapier_sent &&
-      // broaden: any inbound customer leg or a bridged-to-human lead
       (
         call.direction === 'inbound' ||
         call.call_type === 'customer_inquiry' ||
@@ -490,21 +537,7 @@ async function sendToZapier(callId) {
       return;
     }
 
-    const payload = {
-      call_id: call.call_id,
-      timestamp: new Date().toISOString(),
-      customer_phone: call.from_number,
-      call_duration_seconds: call.duration || 0,
-      call_start_time: call.start_time,
-      call_end_time: call.end_time,
-      call_type: call.call_type,
-      call_status: call.status,
-      recording_url: call.recording_url,
-      source: 'Water Damage Restoration Phone System',
-      lead_source: 'Inbound Phone Call',
-      business_phone: call.to_number
-    };
-
+    const payload = buildZapPayload(call);
     console.log('ZAPIER SEND → (…' + zapTail + ')', payload);
 
     const r = await fetch(ZAPIER_WEBHOOK_URL, {
@@ -518,6 +551,8 @@ async function sendToZapier(callId) {
 
     if (r.ok) {
       await upsertFields(callId, { zapier_sent: true, zapier_sent_at: new Date().toISOString() });
+      // Airtable creation log (human-friendly)
+      console.log(`[Airtable] ✅ New lead record created → Call: ${payload['Call ID']} | Customer: ${payload['Customer Phone']} | Recording: ${payload['Recording URL']}`);
     } else {
       console.warn('Zapier returned non-200. Will retry in 30s.');
       setTimeout(async () => { await sendToZapier(callId); }, 30000);
