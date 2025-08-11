@@ -11,7 +11,7 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- Optional recorded prompts (leave off for now) ---
+// --- Optional recorded prompts (you can enable later) ---
 const USE_RECORDED_PROMPTS = String(process.env.USE_RECORDED_PROMPTS || 'false').toLowerCase() === 'true';
 const GREETING_AUDIO_URL = process.env.GREETING_AUDIO_URL || '';
 const MENU_AUDIO_URL = process.env.MENU_AUDIO_URL || '';
@@ -135,6 +135,10 @@ function telnyxHeaders() {
 }
 const HUMAN_PHONE_NUMBER = process.env.HUMAN_PHONE_NUMBER || '';
 const TELNYX_PHONE_NUMBER = process.env.TELNYX_PHONE_NUMBER || '';
+const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL || '';
+
+const zapTail = ZAPIER_WEBHOOK_URL ? ZAPIER_WEBHOOK_URL.slice(-8) : '(none)';
+console.log(`Zapier webhook configured: ${!!ZAPIER_WEBHOOK_URL} (…${zapTail})`);
 
 // Answer + start recording + menu
 async function answerAndIntro(callId) {
@@ -321,8 +325,8 @@ async function handleRecordingSaved(data) {
   }
   await upsertFields(call_id, { transcript: 'Transcript generation in progress...' });
 
-  const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-  if (call?.status === 'completed' && call?.recording_url) await scheduleZapierWebhook(call_id);
+  // Decide whether to send to Zapier (broadened condition, with logs)
+  await scheduleZapierWebhook(call_id);
 }
 
 async function handleDTMF(data) {
@@ -363,7 +367,7 @@ async function connectToHuman(customerCallId) {
       body: JSON.stringify({
         to: HUMAN_PHONE_NUMBER,
         from: TELNYX_PHONE_NUMBER,
-        connection_id: "2755388541746808609", // your Telnyx connection id (kept from your working config)
+        connection_id: "2755388541746808609", // your Telnyx connection id
         webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls',
         machine_detection: 'disabled',
         timeout_secs: 30
@@ -441,54 +445,98 @@ async function handleHumanNoAnswer(callId) {
   await speakToCall(callId, "I’m sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep. When you're done, you can hang up.");
 }
 
-// --- Zapier ---
+// --- Zapier (broadened condition + stronger logging) ---
 async function scheduleZapierWebhook(callId) {
   try {
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+
     const shouldSend =
-      (call?.call_type === 'customer_inquiry' || call?.call_type === 'human_connected') &&
-      call?.status === 'completed' &&
-      call?.recording_url &&
-      !call?.zapier_sent;
+      call &&
+      call.status === 'completed' &&
+      !!call.recording_url &&
+      !call.zapier_sent &&
+      // broaden: any inbound customer leg or a bridged-to-human lead
+      (
+        call.direction === 'inbound' ||
+        call.call_type === 'customer_inquiry' ||
+        call.call_type === 'human_connected' ||
+        call.call_type === 'human_transfer'
+      );
+
+    console.log('ZAPIER DECISION →', {
+      call_id: callId,
+      direction: call?.direction,
+      status: call?.status,
+      call_type: call?.call_type,
+      hasRecording: !!call?.recording_url,
+      zapier_sent: !!call?.zapier_sent,
+      shouldSend
+    });
+
     if (!shouldSend) return;
-    setTimeout(async () => { await sendToZapier(callId); }, 5000);
+    setTimeout(async () => { await sendToZapier(callId); }, 3000);
   } catch (e) { console.error('scheduleZapierWebhook error:', e); }
 }
 
 async function sendToZapier(callId) {
   try {
-    const zapUrl = process.env.ZAPIER_WEBHOOK_URL;
-    if (!zapUrl) return;
+    if (!ZAPIER_WEBHOOK_URL) {
+      console.warn('ZAPIER SEND SKIPPED (no webhook URL configured)');
+      return;
+    }
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-    if (!call) return;
+    if (!call) {
+      console.warn('ZAPIER SEND SKIPPED (call not found):', callId);
+      return;
+    }
 
     const payload = {
       call_id: call.call_id,
       timestamp: new Date().toISOString(),
       customer_phone: call.from_number,
-      customer_name: call.customer_name || 'Name collected during call',
-      customer_zip_code: call.customer_zip_code || 'Zip code collected during call',
       call_duration_seconds: call.duration || 0,
       call_start_time: call.start_time,
       call_end_time: call.end_time,
       call_type: call.call_type,
       call_status: call.status,
       recording_url: call.recording_url,
-      transcript: call.transcript,
-      lead_quality: call.lead_quality || 'To be determined',
-      notes: call.notes || '',
-      business_phone: call.to_number,
       source: 'Water Damage Restoration Phone System',
-      lead_source: 'Inbound Phone Call'
+      lead_source: 'Inbound Phone Call',
+      business_phone: call.to_number
     };
 
-    const r = await fetch(zapUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    if (r.ok) await upsertFields(callId, { zapier_sent: true, zapier_sent_at: new Date().toISOString() });
-    else setTimeout(async () => { await sendToZapier(callId); }, 30000);
+    console.log('ZAPIER SEND → (…' + zapTail + ')', payload);
+
+    const r = await fetch(ZAPIER_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await r.text().catch(() => '');
+    console.log('ZAPIER RESP → status:', r.status, 'body:', text.slice(0, 300));
+
+    if (r.ok) {
+      await upsertFields(callId, { zapier_sent: true, zapier_sent_at: new Date().toISOString() });
+    } else {
+      console.warn('Zapier returned non-200. Will retry in 30s.');
+      setTimeout(async () => { await sendToZapier(callId); }, 30000);
+    }
   } catch (e) {
+    console.error('sendToZapier error:', e);
     setTimeout(async () => { await sendToZapier(callId); }, 60000);
   }
 }
+
+// --- Manual re-send to Zapier (helpful for testing) ---
+app.post('/api/calls/:callId/send-to-zapier', async (req, res) => {
+  try {
+    await sendToZapier(req.params.callId);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // --- Simple UI endpoints ---
 app.get('/', (req, res) => res.sendFile(join(__dirname, 'public', 'index.html')));
