@@ -737,20 +737,36 @@ async function onRecordingSaved(data) {
   const telnyxUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
   let finalUrl = telnyxUrl;
 
+  console.log(`🎥 RECORDING SAVED: ${call_id}, URL: ${telnyxUrl}`);
+
   try {
     await dbRun('BEGIN IMMEDIATE');
     finalUrl = await mirrorRecordingToSpaces(call_id, telnyxUrl);
     await upsertFields(call_id, { recording_url: finalUrl });
     await dbRun('COMMIT');
+    console.log(`✅ RECORDING URL UPDATED in DB: ${call_id} -> ${finalUrl}`);
   } catch (e) {
+    console.error(`❌ RECORDING UPDATE FAILED: ${call_id}:`, e);
     try { await dbRun('ROLLBACK'); } catch {}
   }
 
   // best-effort transcription
   transcribeAndStore(call_id, finalUrl).catch(() => {});
 
+  // Check call status and trigger Zapier
   const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-  if (call?.status === 'completed' && call?.recording_url) await scheduleZapierWebhook(call_id);
+  console.log(`🔍 CALL STATUS CHECK for Zapier: ${call_id}`);
+  console.log(`   - status: ${call?.status}`);
+  console.log(`   - recording_url: ${call?.recording_url ? 'exists' : 'missing'}`);
+  console.log(`   - call_type: ${call?.call_type}`);
+  console.log(`   - direction: ${call?.direction}`);
+  
+  if (call?.recording_url) {
+    console.log(`✅ RECORDING EXISTS, scheduling Zapier webhook for ${call_id}`);
+    await scheduleZapierWebhook(call_id);
+  } else {
+    console.log(`❌ NO RECORDING URL found for ${call_id}, skipping Zapier`);
+  }
 }
 
 async function onDTMF(data) {
@@ -901,15 +917,11 @@ async function scheduleZapierWebhook(callId) {
     console.log(`   - recording_url: ${call?.recording_url ? 'exists' : 'missing'}`);
     console.log(`   - zapier_sent: ${call?.zapier_sent}`);
     
-    // *** FIXED: More comprehensive check for customer calls ***
+    // *** FIXED: Always send for inbound calls with recordings ***
     const shouldSend =
-      call?.status === 'completed' &&
       call?.recording_url &&
       !call?.zapier_sent &&
-      (call?.direction === 'inbound' || 
-       call?.call_type === 'customer_inquiry' || 
-       call?.call_type === 'human_connected' || 
-       call?.call_type === 'human_transfer');
+      call?.direction === 'inbound';
       
     console.log('ZAPIER DECISION →', {
       call_id: callId,
@@ -923,6 +935,9 @@ async function scheduleZapierWebhook(callId) {
     
     if (!shouldSend) {
       console.log(`❌ ZAPIER SKIP: Not sending webhook for ${callId}`);
+      if (!call?.recording_url) console.log(`   Reason: No recording URL`);
+      if (call?.zapier_sent) console.log(`   Reason: Already sent`);
+      if (call?.direction !== 'inbound') console.log(`   Reason: Not inbound call (direction: ${call?.direction})`);
       return;
     }
     
