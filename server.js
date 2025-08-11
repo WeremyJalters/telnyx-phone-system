@@ -380,6 +380,7 @@ async function onSpeakEnded(data, clientState) {
   const call_id = data?.payload?.call_control_id || data?.call_control_id;
   
   console.log(`🔊 SPEAK ENDED: call_id=${call_id}`);
+  console.log(`🔊 CURRENT pendingBridges Map:`, Array.from(pendingBridges.entries()));
   
   // Check if this is a human leg waiting to bridge
   const bridgeInfo = pendingBridges.get(call_id);
@@ -394,7 +395,9 @@ async function onSpeakEnded(data, clientState) {
     // Attempt bridge
     await attemptBridge(bridgeInfo.customerCallId, call_id);
   } else {
-    console.log(`🔊 SPEAK ENDED - No bridge pending for call ${call_id}. bridgeInfo:`, bridgeInfo ? JSON.stringify(bridgeInfo, null, 2) : 'null');
+    console.log(`🔊 SPEAK ENDED - No bridge pending for call ${call_id}.`);
+    console.log(`🔊 bridgeInfo:`, bridgeInfo ? JSON.stringify(bridgeInfo, null, 2) : 'null');
+    console.log(`🔊 ALL pending bridges:`, Array.from(pendingBridges.entries()));
   }
 }
 
@@ -622,7 +625,18 @@ async function onCallAnswered(data, clientState) {
         await speakToCall(call_id, "Customer is on the line. Connecting you now.");
       }
       console.log(`🔊 GREETING STARTED, waiting for speak.ended webhook to trigger bridge`);
-      // Bridge will happen when speak.ended webhook is received
+      
+      // *** FALLBACK TIMEOUT - Bridge after 4 seconds if no speak.ended ***
+      setTimeout(async () => {
+        const stillPending = pendingBridges.get(call_id);
+        if (stillPending && stillPending.readyToBridge) {
+          console.log(`⏰ FALLBACK BRIDGE TIMEOUT: speak.ended not received for ${call_id}, attempting bridge anyway`);
+          pendingBridges.delete(call_id);
+          await attemptBridge(customerCallId, call_id);
+        }
+      }, 4000);
+      
+      // Bridge will happen when speak.ended webhook is received OR after 4s timeout
     } catch (err) {
       console.error(`❌ ERROR playing greeting to ${call_id}:`, err);
       console.log(`🔄 FALLBACK: Attempting bridge after 2s delay`);
@@ -638,12 +652,18 @@ async function onCallHangup(data, clientState) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
   const end_time = new Date().toISOString();
 
-  // Clean up any pending bridge info
+  // Clean up any pending bridge info - BUT LOG IT FIRST
+  const wasPendingBridge = pendingBridges.has(call_id);
+  if (wasPendingBridge) {
+    console.log(`🔚 CALL HANGUP: Removing pending bridge for ${call_id}:`, pendingBridges.get(call_id));
+  }
   pendingBridges.delete(call_id);
 
   const rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
   const wasCustomer = rec?.direction === 'inbound' || rec?.call_type === 'customer_inquiry';
   const wasHuman = rec?.call_type === 'human_representative';
+
+  console.log(`🔚 CALL HANGUP: ${call_id}, wasCustomer: ${wasCustomer}, wasHuman: ${wasHuman}, wasPendingBridge: ${wasPendingBridge}`);
 
   let duration = null;
   if (rec?.start_time) {
