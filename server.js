@@ -83,12 +83,12 @@ const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CR
 
 db.serialize(() => {
   db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA synchronous = FULL;');
+  db.exec('PRAGMA synchronous = NORMAL;'); // was FULL, relaxed a bit to reduce stalls
   db.exec('PRAGMA cache_size = 1000;');
   db.exec('PRAGMA temp_store = memory;');
   db.exec('PRAGMA busy_timeout = 30000;');
   db.exec('PRAGMA foreign_keys = ON;');
-  db.exec('PRAGMA locking_mode = EXCLUSIVE;');
+  db.exec('PRAGMA locking_mode = NORMAL;'); // was EXCLUSIVE; NORMAL avoids blocking on concurrent reads
   console.log('Database PRAGMA settings applied');
 });
 
@@ -144,28 +144,40 @@ async function initDatabase() {
   console.log('Existing calls in DB:', count?.count || 0);
 }
 
-// upsert helpers
-async function upsertCall(obj) {
-  const cols = Object.keys(obj);
-  const placeholders = cols.map(() => '?').join(', ');
-  const updates = cols.filter(c => c !== 'call_id').map(c => `${c}=COALESCE(excluded.${c}, ${c})`).join(', ');
-  const sql = `INSERT INTO calls (${cols.join(', ')}) VALUES (${placeholders})
-               ON CONFLICT(call_id) DO UPDATE SET ${updates}`;
-  return dbRun(sql, cols.map(c => obj[c]));
+// upsert helpers (order-safe)
+function normalizedColumns(obj) {
+  // Ensure a stable column order for INSERT so fields don't get misaligned
+  const order = [
+    'call_id','direction','from_number','to_number','status','start_time','end_time','duration',
+    'recording_url','transcript','transcript_url','call_type','customer_info','contractor_info',
+    'notes','customer_zip_code','customer_name','lead_quality','zapier_sent','zapier_sent_at',
+    'pending_human_call_id','linked_customer_call_id','human_dial_started_at','human_answered_at','created_at'
+  ];
+  const cols = [];
+  const vals = [];
+  for (const k of order) {
+    if (Object.prototype.hasOwnProperty.call(obj, k)) {
+      cols.push(k);
+      vals.push(obj[k]);
+    }
+  }
+  return { cols, vals };
 }
 
-// NEW: Safe upsert that only updates specific fields without touching others
-async function upsertFields(call_id, fields) { 
-  const cols = Object.keys(fields);
-  if (cols.length === 0) return;
-  
-  const updates = cols.map(c => `${c} = ?`).join(', ');
-  const sql = `UPDATE calls SET ${updates} WHERE call_id = ?`;
-  const params = [...cols.map(c => fields[c]), call_id];
-  
-  console.log(`📝 UPDATING FIELDS for ${call_id}:`, fields);
-  return dbRun(sql, params);
+async function upsertCall(obj) {
+  if (!obj.call_id) throw new Error('upsertCall requires call_id');
+  const { cols, vals } = normalizedColumns(obj);
+  const placeholders = cols.map(() => '?').join(', ');
+  // COALESCE(excluded.col, calls.col) keeps existing values when excluded is NULL/undefined
+  const updates = cols
+    .filter(c => c !== 'call_id')
+    .map(c => `${c}=COALESCE(excluded.${c}, ${c})`)
+    .join(', ');
+  const sql = `INSERT INTO calls (${cols.join(', ')}) VALUES (${placeholders})
+               ON CONFLICT(call_id) DO UPDATE SET ${updates}`;
+  return dbRun(sql, vals);
 }
+async function upsertFields(call_id, fields) { return upsertCall({ call_id, ...fields }); }
 
 // -------- Utilities --------
 function waitMs(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -400,7 +412,6 @@ app.post('/webhooks/calls', async (req, res) => {
         break;
       case 'call.bridged': 
         console.log(`🌉 TELNYX CONFIRMS BRIDGE for: ${callId}`);
-        // Log the bridge event details
         console.log(`🌉 BRIDGE EVENT DATA:`, JSON.stringify(data, null, 2));
         break;
       case 'call.speak.ended': 
@@ -426,33 +437,24 @@ app.post('/webhooks/calls', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// -------- New handler for speak.ended to trigger bridge --------
+// -------- speak.ended handler triggers bridge (or fallback) --------
 async function onSpeakEnded(data, clientState) {
   const call_id = data?.payload?.call_control_id || data?.call_control_id;
   
   console.log(`🔊 SPEAK ENDED: call_id=${call_id}`);
   console.log(`🔊 CURRENT pendingBridges Map:`, Array.from(pendingBridges.entries()));
   
-  // Check if this is a human leg waiting to bridge
   const bridgeInfo = pendingBridges.get(call_id);
   if (bridgeInfo && bridgeInfo.readyToBridge) {
     console.log(`🌉 BRIDGE TRIGGER: Human call ${call_id} speak ended, attempting bridge to customer ${bridgeInfo.customerCallId}`);
-    console.log(`🌉 BRIDGE INFO:`, JSON.stringify(bridgeInfo, null, 2));
-    
-    // Remove from pending
     pendingBridges.delete(call_id);
-    console.log(`🌉 REMOVED from pendingBridges, remaining count: ${pendingBridges.size}`);
-    
-    // Attempt bridge
     await attemptBridge(bridgeInfo.customerCallId, call_id);
   } else {
     console.log(`🔊 SPEAK ENDED - No bridge pending for call ${call_id}.`);
-    console.log(`🔊 bridgeInfo:`, bridgeInfo ? JSON.stringify(bridgeInfo, null, 2) : 'null');
-    console.log(`🔊 ALL pending bridges:`, Array.from(pendingBridges.entries()));
   }
 }
 
-// -------- New function to handle bridging --------
+// -------- Bridging --------
 async function attemptBridge(customerCallId, humanCallId) {
   console.log(`🌉 BRIDGE ATTEMPT START: customer=${customerCallId}, human=${humanCallId}`);
   
@@ -521,9 +523,7 @@ async function attemptBridge(customerCallId, humanCallId) {
     } else {
       const errorText = await bridge.text();
       const errorHeaders = {};
-      bridge.headers.forEach((value, key) => {
-        errorHeaders[key] = value;
-      });
+      bridge.headers.forEach((value, key) => { errorHeaders[key] = value; });
       
       console.error(`❌ BRIDGE FAILED: status=${bridge.status}`);
       console.error(`❌ BRIDGE ERROR HEADERS:`, JSON.stringify(errorHeaders, null, 2));
@@ -554,29 +554,24 @@ async function attemptBridge(customerCallId, humanCallId) {
   } catch (err) {
     console.error(`💥 BRIDGE EXCEPTION in attemptBridge:`, err);
     console.error(`💥 BRIDGE EXCEPTION STACK:`, err.stack);
-    console.error(`💥 BRIDGE EXCEPTION DETAILS:`);
-    console.error(`   - Customer Call ID: ${customerCallId}`);
-    console.error(`   - Human Call ID: ${humanCallId}`);
-    
     try {
       await speakToCall(humanCallId, "We're having technical difficulties. Sorry about that.");
-    } catch (speakErr) {
-      console.error(`💥 ERROR speaking to human after bridge exception:`, speakErr);
-    }
+    } catch {}
   }
 }
 
 // -------- Handlers --------
 async function onCallInitiated(data, clientState) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
-  const dir = data.payload?.direction || data.direction; // 'incoming' or 'outgoing'
-  const from_number = data.payload?.from || data.from;
-  const to_number = data.payload?.to || data.to;
+  const dirRaw = data.payload?.direction || data.direction; // 'incoming' or 'outgoing'
+  const dir = dirRaw === 'incoming' ? 'inbound' : 'outbound';
+  const from_number = data.payload?.from || data.from || null;
+  const to_number = data.payload?.to || data.to || null;
   const start_time = new Date().toISOString();
 
   console.log(`🚀 CALL INITIATED: ${call_id}, direction: ${dir}`);
 
-  if (dir === 'incoming') {
+  if (dir === 'inbound') {
     console.log(`📞 INCOMING CALL: ${call_id} from ${from_number}`);
     await upsertCall({
       call_id, direction: 'inbound', from_number, to_number,
@@ -584,30 +579,30 @@ async function onCallInitiated(data, clientState) {
     });
     await answerAndIntro(call_id);
   } else {
-    // Outbound leg (likely human rep) - Check if record already exists
+    // Outbound leg (likely human rep) - ensure record has correct flags
     console.log(`📞 OUTBOUND CALL: ${call_id} to ${to_number}`);
-    
+    const linked_customer_call_id = clientState?.customer_call_id || null;
     const existingRecord = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-    
+
     if (existingRecord) {
-      console.log(`📝 EXISTING RECORD FOUND for ${call_id}, updating ONLY status and timing`);
-      console.log(`📝 EXISTING RECORD:`, JSON.stringify(existingRecord, null, 2));
-      
-      // ONLY update specific fields, don't touch call_type or linked_customer_call_id
-      await dbRun('UPDATE calls SET status = ?, start_time = ?, from_number = ?, to_number = ? WHERE call_id = ?', 
-        ['initiated', start_time, from_number, to_number, call_id]);
-      
-      console.log(`✅ UPDATED existing record with minimal changes`);
+      // Make sure critical fields are not left null
+      await upsertFields(call_id, {
+        direction: existingRecord.direction || 'outbound',
+        from_number: from_number || existingRecord.from_number || TELNYX_PHONE_NUMBER || null,
+        to_number: to_number || existingRecord.to_number || HUMAN_PHONE_NUMBER || null,
+        status: 'initiated',
+        start_time,
+        call_type: existingRecord.call_type || 'human_representative',
+        linked_customer_call_id: existingRecord.linked_customer_call_id || linked_customer_call_id
+      });
+      console.log(`✅ OUTBOUND RECORD UPDATED / NORMALIZED for ${call_id}`);
     } else {
-      console.log(`📝 NO EXISTING RECORD for ${call_id}, this should not happen for human calls`);
-      
-      // Fallback - create basic outbound record
-      let linked_customer_call_id = clientState?.customer_call_id || null;
       await upsertCall({
         call_id, direction: 'outbound', from_number, to_number,
         status: 'initiated', start_time, call_type: 'human_representative',
-        linked_customer_call_id, human_dial_started_at: start_time
+        linked_customer_call_id
       });
+      console.log(`📝 OUTBOUND RECORD CREATED for ${call_id}`);
     }
   }
 }
@@ -618,28 +613,32 @@ async function onCallAnswered(data, clientState) {
   
   await upsertFields(call_id, { status: 'answered' });
 
-  // Determine if this is the human leg - use clientState as primary indicator
-  let isHumanLeg = false;
-  let customerCallId = clientState?.customer_call_id || null;
+  // Load record and normalize critical fields that might be missing due to race conditions
+  let rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
+  const customerCallIdFromState = clientState?.customer_call_id || null;
 
-  // If we have clientState with customer_call_id, this is definitely a human leg
-  if (customerCallId) {
-    isHumanLeg = true;
-    console.log(`👤 HUMAN LEG DETECTED via clientState: ${call_id} -> customer: ${customerCallId}`);
-  } else {
-    // Fallback: check database record
-    const rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-    console.log(`📞 CALL RECORD:`, JSON.stringify(rec, null, 2));
-    
-    if (rec?.call_type === 'human_representative') {
-      isHumanLeg = true;
-      customerCallId = rec.linked_customer_call_id;
-      console.log(`👤 HUMAN LEG DETECTED via database: ${call_id} -> customer: ${customerCallId}`);
-    } else {
-      console.log(`📞 CUSTOMER CALL: ${call_id}`);
-    }
+  // If this is clearly the human leg (outbound or has client_state), enforce fields
+  const assumeHuman = rec?.direction === 'outbound' || !!customerCallIdFromState;
+  if (assumeHuman) {
+    await upsertFields(call_id, {
+      call_type: rec?.call_type || 'human_representative',
+      linked_customer_call_id: rec?.linked_customer_call_id || customerCallIdFromState || null,
+      direction: rec?.direction || 'outbound'
+    });
+    rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
   }
-  
+
+  // Determine if this is the human leg
+  let isHumanLeg = false;
+  let customerCallId = customerCallIdFromState || rec?.linked_customer_call_id || null;
+
+  if (rec?.call_type === 'human_representative') isHumanLeg = true;
+  // Backup signal: outbound + has linked customer implies human leg
+  if (!isHumanLeg && rec?.direction === 'outbound' && customerCallId) isHumanLeg = true;
+  // Final backup: if client_state says customer_call_id exists, treat as human leg
+  if (!isHumanLeg && customerCallIdFromState) isHumanLeg = true;
+
+  console.log(`📞 CALL RECORD:`, JSON.stringify(rec, null, 2));
   console.log(`📞 CALL ANALYSIS: isHumanLeg=${isHumanLeg}, customerCallId=${customerCallId}`);
 
   if (isHumanLeg && customerCallId) {
@@ -687,7 +686,7 @@ async function onCallAnswered(data, clientState) {
       }
       console.log(`🔊 GREETING STARTED, waiting for speak.ended webhook to trigger bridge`);
       
-      // *** FALLBACK TIMEOUT - Bridge after 4 seconds if no speak.ended ***
+      // *** FALLBACK TIMEOUT - Bridge after HUMAN_BRIDGE_GREETING_MS if no speak.ended ***
       setTimeout(async () => {
         const stillPending = pendingBridges.get(call_id);
         if (stillPending && stillPending.readyToBridge) {
@@ -695,13 +694,11 @@ async function onCallAnswered(data, clientState) {
           pendingBridges.delete(call_id);
           await attemptBridge(customerCallId, call_id);
         }
-      }, 4000);
+      }, HUMAN_BRIDGE_GREETING_MS);
       
-      // Bridge will happen when speak.ended webhook is received OR after 4s timeout
     } catch (err) {
       console.error(`❌ ERROR playing greeting to ${call_id}:`, err);
       console.log(`🔄 FALLBACK: Attempting bridge after 2s delay`);
-      // Fallback - try bridge anyway after delay
       setTimeout(() => attemptBridge(customerCallId, call_id), 2000);
     }
   } else {
@@ -713,7 +710,7 @@ async function onCallHangup(data, clientState) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
   const end_time = new Date().toISOString();
 
-  // Clean up any pending bridge info - BUT LOG IT FIRST
+  // Clean up any pending bridge info
   const wasPendingBridge = pendingBridges.has(call_id);
   if (wasPendingBridge) {
     console.log(`🔚 CALL HANGUP: Removing pending bridge for ${call_id}:`, pendingBridges.get(call_id));
@@ -724,7 +721,7 @@ async function onCallHangup(data, clientState) {
   const wasCustomer = rec?.direction === 'inbound' || rec?.call_type === 'customer_inquiry';
   const wasHuman = rec?.call_type === 'human_representative';
 
-  console.log(`🔚 CALL HANGUP: ${call_id}, wasCustomer: ${wasCustomer}, wasHuman: ${wasHuman}, wasPendingBridge: ${wasPendingBridge}`);
+  console.log(`🔚 CALL HANGUP: ${call_id}, wasCustomer: ${!!wasCustomer}, wasHuman: ${!!wasHuman}, wasPendingBridge: ${wasPendingBridge}`);
 
   let duration = null;
   if (rec?.start_time) {
@@ -777,20 +774,8 @@ async function onRecordingSaved(data) {
   // best-effort transcription
   transcribeAndStore(call_id, finalUrl).catch(() => {});
 
-  // Check call status and trigger Zapier
-  const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-  console.log(`🔍 CALL STATUS CHECK for Zapier: ${call_id}`);
-  console.log(`   - status: ${call?.status}`);
-  console.log(`   - recording_url: ${call?.recording_url ? 'exists' : 'missing'}`);
-  console.log(`   - call_type: ${call?.call_type}`);
-  console.log(`   - direction: ${call?.direction}`);
-  
-  if (call?.recording_url) {
-    console.log(`✅ RECORDING EXISTS, scheduling Zapier webhook for ${call_id}`);
-    await scheduleZapierWebhook(call_id);
-  } else {
-    console.log(`❌ NO RECORDING URL found for ${call_id}, skipping Zapier`);
-  }
+  // Always consider for Zapier when we have a recording
+  await scheduleZapierWebhook(call_id);
 }
 
 async function onDTMF(data) {
@@ -826,7 +811,7 @@ async function connectToHuman(customerCallId) {
       return;
     }
 
-    console.log(`📝 UPDATING customer ${customerCallId} to human_transfer status`);
+    // Mark requested human transfer
     await upsertFields(customerCallId, { call_type: 'human_transfer', notes: 'Customer requested human representative' });
 
     const cs = b64({ customer_call_id: customerCallId });
@@ -929,24 +914,18 @@ const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL || '';
 console.log('Zapier webhook configured:', !!ZAPIER_WEBHOOK_URL, `(${ZAPIER_WEBHOOK_URL ? ZAPIER_WEBHOOK_URL.slice(0, 25) + '…' : ''}`);
 console.log(')');
 
+// Always send when: inbound call + we have a recording + not previously sent
 async function scheduleZapierWebhook(callId) {
   try {
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-    
-    // Enhanced logging for Zapier decision
     console.log(`🔍 ZAPIER CHECK for ${callId}:`);
     console.log(`   - call_type: ${call?.call_type}`);
     console.log(`   - status: ${call?.status}`);
     console.log(`   - direction: ${call?.direction}`);
     console.log(`   - recording_url: ${call?.recording_url ? 'exists' : 'missing'}`);
     console.log(`   - zapier_sent: ${call?.zapier_sent}`);
-    
-    // *** FIXED: Always send for inbound calls with recordings ***
-    const shouldSend =
-      call?.recording_url &&
-      !call?.zapier_sent &&
-      call?.direction === 'inbound';
-      
+
+    const shouldSend = !!(call?.recording_url && !call?.zapier_sent && call?.direction === 'inbound');
     console.log('ZAPIER DECISION →', {
       call_id: callId,
       direction: call?.direction || null,
@@ -956,15 +935,8 @@ async function scheduleZapierWebhook(callId) {
       zapier_sent: !!call?.zapier_sent,
       shouldSend
     });
-    
-    if (!shouldSend) {
-      console.log(`❌ ZAPIER SKIP: Not sending webhook for ${callId}`);
-      if (!call?.recording_url) console.log(`   Reason: No recording URL`);
-      if (call?.zapier_sent) console.log(`   Reason: Already sent`);
-      if (call?.direction !== 'inbound') console.log(`   Reason: Not inbound call (direction: ${call?.direction})`);
-      return;
-    }
-    
+
+    if (!shouldSend) return;
     console.log(`✅ ZAPIER SCHEDULED: Will send webhook for ${callId} in 3 seconds`);
     setTimeout(async () => { await sendToZapier(callId); }, 3000);
   } catch (e) { 
@@ -1008,7 +980,7 @@ async function sendToZapier(callId) {
       method: 'POST', 
       headers: { 'Content-Type': 'application/json' }, 
       body: JSON.stringify(payload),
-      timeout: 30000  // 30 second timeout
+      timeout: 30000
     });
     const endTime = Date.now();
     
