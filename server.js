@@ -581,13 +581,11 @@ async function onCallInitiated(data, clientState) {
       console.log(`📝 EXISTING RECORD FOUND for ${call_id}, updating status and timing`);
       console.log(`📝 EXISTING RECORD:`, JSON.stringify(existingRecord, null, 2));
       
-      // Just update the status and timing, preserve existing data
-      await upsertFields(call_id, {
-        status: 'initiated',
-        start_time,
-        from_number,
-        to_number
-      });
+      / ONLY update specific fields, don't touch call_type or linked_customer_call_id
+await dbRun('UPDATE calls SET status = ?, start_time = ?, from_number = ?, to_number = ? WHERE call_id = ?', 
+  ['initiated', start_time, from_number, to_number, call_id]);
+
+console.log(`✅ UPDATED existing record with minimal changes`);
     } else {
       console.log(`📝 NO EXISTING RECORD for ${call_id}, this should not happen for human calls`);
       
