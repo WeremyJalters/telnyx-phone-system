@@ -270,7 +270,16 @@ async function handleCallInitiated(data) {
 
 async function handleCallAnswered(data) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
-  await upsertFields(call_id, { status: 'answered' });
+
+  // Capture numbers here too in case 'answered' arrives before 'initiated'
+  const from_number = data.payload?.from || data.from;
+  const to_number   = data.payload?.to   || data.to;
+
+  await upsertFields(call_id, {
+    status: 'answered',
+    ...(from_number ? { from_number } : {}),
+    ...(to_number   ? { to_number   } : {})
+  });
 
   const existing = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
   const isRepLeg = pendingByHuman.has(call_id) || existing?.call_type === 'human_representative';
@@ -354,7 +363,7 @@ async function connectToHuman(customerCallId) {
       body: JSON.stringify({
         to: HUMAN_PHONE_NUMBER,
         from: TELNYX_PHONE_NUMBER,
-        connection_id: "2755388541746808609", // your Telnyx connection id (kept as in your working config)
+        connection_id: "2755388541746808609", // your Telnyx connection id (kept from your working config)
         webhook_url: process.env.WEBHOOK_BASE_URL + '/webhooks/calls',
         machine_detection: 'disabled',
         timeout_secs: 30
@@ -481,7 +490,7 @@ async function sendToZapier(callId) {
   }
 }
 
-// --- Simple UI endpoints (unchanged essentials) ---
+// --- Simple UI endpoints ---
 app.get('/', (req, res) => res.sendFile(join(__dirname, 'public', 'index.html')));
 app.get('/health', (req, res) => res.json({ status: 'healthy', timestamp: new Date().toISOString(), port: PORT, nodeVersion: process.version }));
 
