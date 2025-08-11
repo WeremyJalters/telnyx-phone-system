@@ -163,21 +163,44 @@ function parseB64(s) { try { return JSON.parse(Buffer.from(s || '', 'base64').to
 // -------- Telnyx Call Control helpers --------
 async function answerAndIntro(callId) {
   try {
+    console.log(`📞 ANSWERING CALL: ${callId}`);
     const answer = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
       method: 'POST', headers: telnyxHeaders(), body: JSON.stringify({})
     });
-    if (!answer.ok) { console.error('Failed to answer:', await answer.text()); return; }
+    if (!answer.ok) { 
+      console.error('❌ Failed to answer:', await answer.text()); 
+      return; 
+    }
+    console.log(`✅ CALL ANSWERED: ${callId}`);
 
-    await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
+    console.log(`🎥 STARTING RECORDING for ${callId}`);
+    const recordResult = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
       method: 'POST', headers: telnyxHeaders(), body: JSON.stringify({ format: 'mp3', channels: 'dual' })
-    }).catch(() => {});
+    }).catch((e) => {
+      console.error(`❌ RECORDING START FAILED for ${callId}:`, e);
+    });
+    
+    if (recordResult && !recordResult.ok) {
+      console.error(`❌ RECORDING START HTTP ERROR for ${callId}:`, await recordResult.text());
+    } else {
+      console.log(`✅ RECORDING STARTED for ${callId}`);
+    }
 
+    console.log(`🔊 PREPARING IVR MENU for ${callId}`);
     if (USE_RECORDED_PROMPTS && GREETING_AUDIO_URL) {
+      console.log(`🔊 PLAYING RECORDED GREETING: ${GREETING_AUDIO_URL}`);
       await playbackAudio(callId, GREETING_AUDIO_URL);
       await waitMs(400);
+    } else {
+      console.log(`🔊 SKIPPING recorded greeting (USE_RECORDED_PROMPTS=${USE_RECORDED_PROMPTS})`);
     }
+    
+    console.log(`🔊 STARTING IVR MENU for ${callId}`);
     await playIVRMenu(callId);
-  } catch (e) { console.error('answerAndIntro error:', e); }
+    console.log(`✅ IVR MENU STARTED for ${callId}`);
+  } catch (e) { 
+    console.error(`💥 answerAndIntro error for ${callId}:`, e); 
+  }
 }
 
 async function playbackAudio(callId, audioUrl) {
@@ -196,6 +219,10 @@ async function speakToCall(callId, message) {
 }
 
 async function gatherUsingSpeak(callId, payload, { min = 1, max = 1, timeoutMs = 12000, term = '#' } = {}) {
+  console.log(`🔊 GATHER_USING_SPEAK: ${callId}`);
+  console.log(`🔊 PAYLOAD: ${payload}`);
+  console.log(`🔊 OPTIONS: min=${min}, max=${max}, timeout=${timeoutMs}, term=${term}`);
+  
   const r = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/gather_using_speak`, {
     method: 'POST', headers: telnyxHeaders(),
     body: JSON.stringify({
@@ -203,7 +230,14 @@ async function gatherUsingSpeak(callId, payload, { min = 1, max = 1, timeoutMs =
       minimum_digits: min, maximum_digits: max, timeout_millis: timeoutMs, terminating_digit: term
     })
   });
-  if (!r.ok) console.error('gather_using_speak failed:', await r.text());
+  
+  console.log(`🔊 GATHER_USING_SPEAK RESPONSE: status=${r.status}`);
+  if (!r.ok) {
+    const errorText = await r.text();
+    console.error(`❌ gather_using_speak failed for ${callId}:`, errorText);
+  } else {
+    console.log(`✅ GATHER_USING_SPEAK succeeded for ${callId}`);
+  }
 }
 
 async function gatherUsingAudio(callId, audioUrl, { min = 1, max = 1, timeoutMs = 12000, term = '#' } = {}) {
@@ -218,17 +252,22 @@ async function gatherUsingAudio(callId, audioUrl, { min = 1, max = 1, timeoutMs 
 }
 
 async function playIVRMenu(callId) {
+  console.log(`🔊 PLAY IVR MENU: ${callId}, USE_RECORDED_PROMPTS=${USE_RECORDED_PROMPTS}, MENU_AUDIO_URL=${MENU_AUDIO_URL}`);
+  
   if (USE_RECORDED_PROMPTS && MENU_AUDIO_URL) {
+    console.log(`🔊 USING RECORDED MENU: ${MENU_AUDIO_URL}`);
     await gatherUsingAudio(callId, MENU_AUDIO_URL, { min: 1, max: 1, timeoutMs: 12000, term: '#' });
   } else {
-    await gatherUsingSpeak(callId,
-      "Thanks for calling our flood and water damage restoration team. " +
+    console.log(`🔊 USING TTS MENU for ${callId}`);
+    const menuText = "Thanks for calling our flood and water damage restoration team. " +
       "Press 1 to be connected to a representative now. " +
       "Press 2 to leave details and we'll call you back. " +
-      "You can also press 0 to reach a representative.",
-      { min: 1, max: 1, timeoutMs: 12000, term: '#' }
-    );
+      "You can also press 0 to reach a representative.";
+    console.log(`🔊 TTS MENU TEXT: ${menuText}`);
+    
+    await gatherUsingSpeak(callId, menuText, { min: 1, max: 1, timeoutMs: 12000, term: '#' });
   }
+  console.log(`✅ IVR MENU COMMAND SENT for ${callId}`);
 }
 
 // -------- Spaces: mirror recording (mp3) --------
