@@ -153,7 +153,19 @@ async function upsertCall(obj) {
                ON CONFLICT(call_id) DO UPDATE SET ${updates}`;
   return dbRun(sql, cols.map(c => obj[c]));
 }
-async function upsertFields(call_id, fields) { return upsertCall({ call_id, ...fields }); }
+
+// NEW: Safe upsert that only updates specific fields without touching others
+async function upsertFields(call_id, fields) { 
+  const cols = Object.keys(fields);
+  if (cols.length === 0) return;
+  
+  const updates = cols.map(c => `${c} = ?`).join(', ');
+  const sql = `UPDATE calls SET ${updates} WHERE call_id = ?`;
+  const params = [...cols.map(c => fields[c]), call_id];
+  
+  console.log(`📝 UPDATING FIELDS for ${call_id}:`, fields);
+  return dbRun(sql, params);
+}
 
 // -------- Utilities --------
 function waitMs(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -606,15 +618,27 @@ async function onCallAnswered(data, clientState) {
   
   await upsertFields(call_id, { status: 'answered' });
 
-  // Determine if this is the human leg
+  // Determine if this is the human leg - use clientState as primary indicator
   let isHumanLeg = false;
   let customerCallId = clientState?.customer_call_id || null;
 
-  const rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-  console.log(`📞 CALL RECORD:`, JSON.stringify(rec, null, 2));
-  
-  if (rec?.call_type === 'human_representative') isHumanLeg = true;
-  if (!customerCallId && rec?.linked_customer_call_id) customerCallId = rec.linked_customer_call_id;
+  // If we have clientState with customer_call_id, this is definitely a human leg
+  if (customerCallId) {
+    isHumanLeg = true;
+    console.log(`👤 HUMAN LEG DETECTED via clientState: ${call_id} -> customer: ${customerCallId}`);
+  } else {
+    // Fallback: check database record
+    const rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
+    console.log(`📞 CALL RECORD:`, JSON.stringify(rec, null, 2));
+    
+    if (rec?.call_type === 'human_representative') {
+      isHumanLeg = true;
+      customerCallId = rec.linked_customer_call_id;
+      console.log(`👤 HUMAN LEG DETECTED via database: ${call_id} -> customer: ${customerCallId}`);
+    } else {
+      console.log(`📞 CUSTOMER CALL: ${call_id}`);
+    }
+  }
   
   console.log(`📞 CALL ANALYSIS: isHumanLeg=${isHumanLeg}, customerCallId=${customerCallId}`);
 
