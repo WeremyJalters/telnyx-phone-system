@@ -20,7 +20,7 @@ const GREETING_AUDIO_URL = process.env.GREETING_AUDIO_URL || '';
 const MENU_AUDIO_URL = process.env.MENU_AUDIO_URL || '';
 const HUMAN_GREETING_AUDIO_URL = process.env.HUMAN_GREETING_AUDIO_URL || '';
 // Staff greeting length before bridging (ms)
-const HUMAN_BRIDGE_GREETING_MS = Number(process.env.HUMAN_BRIDGE_GREETING_MS || 1200);
+const HUMAN_BRIDGE_GREETING_MS = Number(process.env.HUMAN_BRIDGE_GREETING_MS || 3000); // Increased from 1200 to 3000
 
 // -------- Telnyx & Routing --------
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY || '';
@@ -224,7 +224,7 @@ async function playIVRMenu(callId) {
     await gatherUsingSpeak(callId,
       "Thanks for calling our flood and water damage restoration team. " +
       "Press 1 to be connected to a representative now. " +
-      "Press 2 to leave details and we’ll call you back. " +
+      "Press 2 to leave details and we'll call you back. " +
       "You can also press 0 to reach a representative.",
       { min: 1, max: 1, timeoutMs: 12000, term: '#' }
     );
@@ -303,6 +303,8 @@ async function transcribeAndStore(call_id, audioUrl) {
 
 // -------- State (only for timers; mapping is in DB) --------
 const humanTimeouts = new Map(); // key: customerCallId -> timeoutId
+const pendingBridges = new Map(); // key: humanCallId -> { customerCallId, readyToBridge }
+
 function clearHumanTimeout(customerCallId) {
   const t = humanTimeouts.get(customerCallId);
   if (t) { clearTimeout(t); humanTimeouts.delete(customerCallId); }
@@ -316,31 +318,199 @@ app.post('/webhooks/calls', async (req, res) => {
   const event = data?.event_type;
   const callId = data?.payload?.call_control_id || data?.call_control_id;
   const clientState = parseB64(data?.payload?.client_state || data?.client_state);
-  if (event && callId) console.log('Webhook:', event, 'CallID:', callId);
+  
+  // Enhanced webhook logging
+  if (event && callId) {
+    console.log(`🌐 WEBHOOK: ${event} | CallID: ${callId}`);
+    if (clientState) console.log(`🌐 CLIENT_STATE:`, JSON.stringify(clientState, null, 2));
+  }
 
   try {
     switch (event) {
-      case 'call.initiated': await onCallInitiated(data, clientState); break;
-      case 'call.answered': await onCallAnswered(data, clientState); break;
-      case 'call.hangup': await onCallHangup(data, clientState); break;
-      case 'call.recording.saved': await onRecordingSaved(data, clientState); break;
-      case 'call.dtmf.received': await onDTMF(data); break;
-      case 'call.bridged': console.log('Telnyx confirms bridge for:', callId); break;
+      case 'call.initiated': 
+        console.log(`🚀 PROCESSING: call.initiated for ${callId}`);
+        await onCallInitiated(data, clientState); 
+        break;
+      case 'call.answered': 
+        console.log(`📞 PROCESSING: call.answered for ${callId}`);
+        await onCallAnswered(data, clientState); 
+        break;
+      case 'call.hangup': 
+        console.log(`🔚 PROCESSING: call.hangup for ${callId}`);
+        await onCallHangup(data, clientState); 
+        break;
+      case 'call.recording.saved': 
+        console.log(`🎥 PROCESSING: call.recording.saved for ${callId}`);
+        await onRecordingSaved(data, clientState); 
+        break;
+      case 'call.dtmf.received': 
+        console.log(`🔢 PROCESSING: call.dtmf.received for ${callId}`);
+        await onDTMF(data); 
+        break;
+      case 'call.bridged': 
+        console.log(`🌉 TELNYX CONFIRMS BRIDGE for: ${callId}`);
+        // Log the bridge event details
+        console.log(`🌉 BRIDGE EVENT DATA:`, JSON.stringify(data, null, 2));
+        break;
+      case 'call.speak.ended': 
+        console.log(`🔊 PROCESSING: call.speak.ended for ${callId}`);
+        await onSpeakEnded(data, clientState); 
+        break;
 
       case 'call.speak.started':
-      case 'call.speak.ended':
+        console.log(`🔊 SPEAK STARTED for ${callId}`);
+        break;
       case 'call.gather.ended':
+        console.log(`🔢 GATHER ENDED for ${callId}`);
         break;
 
       default:
-        if (event) console.log('Unhandled event:', event);
+        if (event) console.log(`❓ UNHANDLED EVENT: ${event} for ${callId}`);
     }
   } catch (e) {
-    console.error('Webhook error:', e);
+    console.error(`💥 WEBHOOK ERROR processing ${event} for ${callId}:`, e);
+    console.error(`💥 WEBHOOK ERROR STACK:`, e.stack);
   }
 
   res.status(200).send('OK');
 });
+
+// -------- New handler for speak.ended to trigger bridge --------
+async function onSpeakEnded(data, clientState) {
+  const call_id = data?.payload?.call_control_id || data?.call_control_id;
+  
+  console.log(`🔊 SPEAK ENDED: call_id=${call_id}`);
+  
+  // Check if this is a human leg waiting to bridge
+  const bridgeInfo = pendingBridges.get(call_id);
+  if (bridgeInfo && bridgeInfo.readyToBridge) {
+    console.log(`🌉 BRIDGE TRIGGER: Human call ${call_id} speak ended, attempting bridge to customer ${bridgeInfo.customerCallId}`);
+    console.log(`🌉 BRIDGE INFO:`, JSON.stringify(bridgeInfo, null, 2));
+    
+    // Remove from pending
+    pendingBridges.delete(call_id);
+    console.log(`🌉 REMOVED from pendingBridges, remaining count: ${pendingBridges.size}`);
+    
+    // Attempt bridge
+    await attemptBridge(bridgeInfo.customerCallId, call_id);
+  } else {
+    console.log(`🔊 SPEAK ENDED - No bridge pending for call ${call_id}. bridgeInfo:`, bridgeInfo ? JSON.stringify(bridgeInfo, null, 2) : 'null');
+  }
+}
+
+// -------- New function to handle bridging --------
+async function attemptBridge(customerCallId, humanCallId) {
+  console.log(`🌉 BRIDGE ATTEMPT START: customer=${customerCallId}, human=${humanCallId}`);
+  
+  try {
+    // Double-check customer is still active
+    console.log(`🌉 CHECKING CUSTOMER STATUS: ${customerCallId}`);
+    const custNow = await dbGet('SELECT * FROM calls WHERE call_id = ?', [customerCallId]);
+    
+    if (!custNow) {
+      console.log(`❌ BRIDGE ABORT: Customer call ${customerCallId} not found in database`);
+      await speakToCall(humanCallId, "Sorry, the caller disconnected. Thank you.");
+      setTimeout(async () => {
+        console.log(`🔚 HANGING UP HUMAN: ${humanCallId} (customer not found)`);
+        try { 
+          await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { 
+            method: 'POST', headers: telnyxHeaders() 
+          }); 
+        } catch (e) {
+          console.error(`❌ ERROR hanging up human ${humanCallId}:`, e);
+        }
+      }, 2000);
+      return;
+    }
+    
+    if (custNow.status === 'completed') {
+      console.log(`❌ BRIDGE ABORT: Customer call ${customerCallId} already completed (status: ${custNow.status})`);
+      await speakToCall(humanCallId, "Sorry, the caller disconnected. Thank you.");
+      setTimeout(async () => {
+        console.log(`🔚 HANGING UP HUMAN: ${humanCallId} (customer completed)`);
+        try { 
+          await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { 
+            method: 'POST', headers: telnyxHeaders() 
+          }); 
+        } catch (e) {
+          console.error(`❌ ERROR hanging up human ${humanCallId}:`, e);
+        }
+      }, 2000);
+      return;
+    }
+
+    console.log(`✅ CUSTOMER STATUS OK: ${customerCallId} - status: ${custNow.status}, call_type: ${custNow.call_type}`);
+    console.log(`🌉 BRIDGE REQUEST: Bridging ${customerCallId} -> ${humanCallId}`);
+    
+    const bridgeStartTime = Date.now();
+    const bridge = await fetch(`https://api.telnyx.com/v2/calls/${customerCallId}/actions/bridge`, {
+      method: 'POST', 
+      headers: telnyxHeaders(),
+      body: JSON.stringify({ call_control_id: humanCallId })
+    });
+    const bridgeEndTime = Date.now();
+    
+    console.log(`🌉 BRIDGE API RESPONSE: status=${bridge.status}, time=${bridgeEndTime - bridgeStartTime}ms`);
+
+    if (bridge.ok) {
+      const bridgeResponse = await bridge.json();
+      console.log(`✅ BRIDGE SUCCESS: ${customerCallId} <-> ${humanCallId}`);
+      console.log(`🌉 BRIDGE RESPONSE DATA:`, JSON.stringify(bridgeResponse, null, 2));
+      
+      await upsertFields(customerCallId, {
+        call_type: 'human_connected',
+        notes: 'Connected to human representative',
+        pending_human_call_id: null
+      });
+      console.log(`📝 DATABASE UPDATED: Customer ${customerCallId} marked as human_connected`);
+      
+    } else {
+      const errorText = await bridge.text();
+      const errorHeaders = {};
+      bridge.headers.forEach((value, key) => {
+        errorHeaders[key] = value;
+      });
+      
+      console.error(`❌ BRIDGE FAILED: status=${bridge.status}`);
+      console.error(`❌ BRIDGE ERROR HEADERS:`, JSON.stringify(errorHeaders, null, 2));
+      console.error(`❌ BRIDGE ERROR BODY:`, errorText);
+      console.error(`❌ BRIDGE REQUEST DETAILS:`);
+      console.error(`   - Customer Call ID: ${customerCallId}`);
+      console.error(`   - Human Call ID: ${humanCallId}`);
+      console.error(`   - Telnyx API Key: ${TELNYX_API_KEY ? `${TELNYX_API_KEY.substring(0, 10)}...` : 'NOT SET'}`);
+      console.error(`   - Request URL: https://api.telnyx.com/v2/calls/${customerCallId}/actions/bridge`);
+      console.error(`   - Request Body: ${JSON.stringify({ call_control_id: humanCallId })}`);
+      
+      // Handle bridge failure gracefully
+      console.log(`🔊 NOTIFYING PARTIES OF BRIDGE FAILURE`);
+      await speakToCall(humanCallId, "We're having an issue connecting you. Sorry about that.");
+      await speakToCall(customerCallId, "We're having technical difficulties. Please call back in a few minutes.");
+      
+      setTimeout(async () => {
+        console.log(`🔚 HANGING UP HUMAN AFTER BRIDGE FAILURE: ${humanCallId}`);
+        try { 
+          await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { 
+            method: 'POST', headers: telnyxHeaders() 
+          }); 
+        } catch (e) {
+          console.error(`❌ ERROR hanging up human after bridge failure:`, e);
+        }
+      }, 3000);
+    }
+  } catch (err) {
+    console.error(`💥 BRIDGE EXCEPTION in attemptBridge:`, err);
+    console.error(`💥 BRIDGE EXCEPTION STACK:`, err.stack);
+    console.error(`💥 BRIDGE EXCEPTION DETAILS:`);
+    console.error(`   - Customer Call ID: ${customerCallId}`);
+    console.error(`   - Human Call ID: ${humanCallId}`);
+    
+    try {
+      await speakToCall(humanCallId, "We're having technical difficulties. Sorry about that.");
+    } catch (speakErr) {
+      console.error(`💥 ERROR speaking to human after bridge exception:`, speakErr);
+    }
+  }
+}
 
 // -------- Handlers --------
 async function onCallInitiated(data, clientState) {
@@ -369,6 +539,8 @@ async function onCallInitiated(data, clientState) {
 
 async function onCallAnswered(data, clientState) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
+  console.log(`📞 CALL ANSWERED: ${call_id}`);
+  
   await upsertFields(call_id, { status: 'answered' });
 
   // Determine if this is the human leg
@@ -376,63 +548,75 @@ async function onCallAnswered(data, clientState) {
   let customerCallId = clientState?.customer_call_id || null;
 
   const rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
+  console.log(`📞 CALL RECORD:`, JSON.stringify(rec, null, 2));
+  
   if (rec?.call_type === 'human_representative') isHumanLeg = true;
   if (!customerCallId && rec?.linked_customer_call_id) customerCallId = rec.linked_customer_call_id;
+  
+  console.log(`📞 CALL ANALYSIS: isHumanLeg=${isHumanLeg}, customerCallId=${customerCallId}`);
 
   if (isHumanLeg && customerCallId) {
+    console.log(`👤 HUMAN REP ANSWERED: ${call_id}, linked to customer: ${customerCallId}`);
+    
     await upsertFields(call_id, { human_answered_at: new Date().toISOString() });
     clearHumanTimeout(customerCallId);
+    console.log(`⏰ CLEARED timeout for customer: ${customerCallId}`);
 
     // Check the customer leg is still active
+    console.log(`🔍 CHECKING CUSTOMER STATUS: ${customerCallId}`);
     const cust = await dbGet('SELECT * FROM calls WHERE call_id = ?', [customerCallId]);
+    console.log(`🔍 CUSTOMER RECORD:`, JSON.stringify(cust, null, 2));
+    
     if (!cust || cust.status === 'completed') {
+      console.log(`❌ CUSTOMER DISCONNECTED: ${customerCallId} - status: ${cust?.status || 'not found'}`);
       await speakToCall(call_id, "Sorry, the caller disconnected just now. Thank you.");
-      try { await fetch(`https://api.telnyx.com/v2/calls/${call_id}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {}
+      setTimeout(async () => {
+        console.log(`🔚 HANGING UP HUMAN (customer gone): ${call_id}`);
+        try { 
+          await fetch(`https://api.telnyx.com/v2/calls/${call_id}/actions/hangup`, { 
+            method: 'POST', headers: telnyxHeaders() 
+          }); 
+        } catch (e) {
+          console.error(`❌ ERROR hanging up human:`, e);
+        }
+      }, 2000);
       return;
     }
 
-    // *** STAFF GREETING, then BRIDGE ***
+    // *** PLAY GREETING AND MARK AS READY TO BRIDGE ***
+    console.log(`🔊 STARTING GREETING for human call ${call_id}`);
+    
+    // Mark this call as pending bridge
+    pendingBridges.set(call_id, { customerCallId, readyToBridge: true });
+    console.log(`🌉 MARKED FOR BRIDGE: ${call_id} -> ${customerCallId}, pendingBridges size: ${pendingBridges.size}`);
+    
     try {
       if (USE_RECORDED_PROMPTS && HUMAN_GREETING_AUDIO_URL) {
+        console.log(`🔊 PLAYING RECORDED GREETING: ${HUMAN_GREETING_AUDIO_URL}`);
         await playbackAudio(call_id, HUMAN_GREETING_AUDIO_URL);
       } else {
+        console.log(`🔊 PLAYING TTS GREETING to ${call_id}`);
         await speakToCall(call_id, "Customer is on the line. Connecting you now.");
       }
-    } catch { /* non-fatal */ }
-
-    // Bridge after short, configurable delay (do not wait for speak end webhooks)
-    setTimeout(async () => {
-      try {
-        // re-check that customer still not completed
-        const custNow = await dbGet('SELECT status FROM calls WHERE call_id = ?', [customerCallId]);
-        if (!custNow || custNow.status === 'completed') return;
-
-        const bridge = await fetch(`https://api.telnyx.com/v2/calls/${customerCallId}/actions/bridge`, {
-          method: 'POST', headers: telnyxHeaders(),
-          body: JSON.stringify({ call_control_id: call_id })
-        });
-
-        if (bridge.ok) {
-          await upsertFields(customerCallId, {
-            call_type: 'human_connected',
-            notes: 'Connected to human representative',
-            pending_human_call_id: null
-          });
-        } else {
-          console.error('Bridge failed:', await bridge.text());
-          await speakToCall(call_id, "We’re having an issue connecting you. Sorry about that.");
-          await speakToCall(customerCallId, "We’re having technical difficulties. Please call back in a few minutes.");
-        }
-      } catch (err) {
-        console.error('Bridge error after greeting:', err);
-      }
-    }, HUMAN_BRIDGE_GREETING_MS);
+      console.log(`🔊 GREETING STARTED, waiting for speak.ended webhook to trigger bridge`);
+      // Bridge will happen when speak.ended webhook is received
+    } catch (err) {
+      console.error(`❌ ERROR playing greeting to ${call_id}:`, err);
+      console.log(`🔄 FALLBACK: Attempting bridge after 2s delay`);
+      // Fallback - try bridge anyway after delay
+      setTimeout(() => attemptBridge(customerCallId, call_id), 2000);
+    }
+  } else {
+    console.log(`📞 NON-HUMAN CALL ANSWERED: ${call_id} (customer call or other)`);
   }
 }
 
 async function onCallHangup(data, clientState) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
   const end_time = new Date().toISOString();
+
+  // Clean up any pending bridge info
+  pendingBridges.delete(call_id);
 
   const rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
   const wasCustomer = rec?.direction === 'inbound' || rec?.call_type === 'customer_inquiry';
@@ -461,7 +645,7 @@ async function onCallHangup(data, clientState) {
       const cust = await dbGet('SELECT * FROM calls WHERE call_id = ?', [customerCallId]);
       if (cust && cust.status !== 'completed') {
         // Only play this if they didn't already bridge
-        await speakToCall(customerCallId, "Sorry, our representative couldn’t take the call. Please leave your name, phone, address, and details after the beep.");
+        await speakToCall(customerCallId, "Sorry, our representative couldn't take the call. Please leave your name, phone, address, and details after the beep.");
         await upsertFields(customerCallId, { pending_human_call_id: null });
       }
     }
@@ -513,15 +697,23 @@ async function onDTMF(data) {
 
 // -------- Human leg dial & mapping (DB-based) --------
 async function connectToHuman(customerCallId) {
+  console.log(`👤 CONNECT TO HUMAN REQUEST: customer=${customerCallId}`);
+  
   try {
     if (!HUMAN_PHONE_NUMBER) {
+      console.log(`❌ NO HUMAN PHONE NUMBER configured`);
       await speakToCall(customerCallId, "Sorry, we can't reach a representative right now.");
       return;
     }
 
+    console.log(`📝 UPDATING customer ${customerCallId} to human_transfer status`);
     await upsertFields(customerCallId, { call_type: 'human_transfer', notes: 'Customer requested human representative' });
 
     const cs = b64({ customer_call_id: customerCallId });
+    console.log(`📞 DIALING HUMAN: ${HUMAN_PHONE_NUMBER} from ${TELNYX_PHONE_NUMBER}`);
+    console.log(`📞 CLIENT_STATE: ${cs}`);
+    
+    const dialStartTime = Date.now();
     const resp = await fetch('https://api.telnyx.com/v2/calls', {
       method: 'POST',
       headers: telnyxHeaders(),
@@ -535,20 +727,29 @@ async function connectToHuman(customerCallId) {
         timeout_secs: 30
       })
     });
+    const dialEndTime = Date.now();
+
+    console.log(`📞 DIAL API RESPONSE: status=${resp.status}, time=${dialEndTime - dialStartTime}ms`);
 
     if (!resp.ok) {
-      console.error('Failed to call human rep:', await resp.text());
-      await speakToCall(customerCallId, "I’m sorry, we couldn’t reach our representative. Please leave a detailed message after the tone.");
+      const errorText = await resp.text();
+      console.error(`❌ FAILED TO DIAL HUMAN: status=${resp.status}, error=${errorText}`);
+      await speakToCall(customerCallId, "I'm sorry, we couldn't reach our representative. Please leave a detailed message after the tone.");
       return;
     }
 
     const json = await resp.json();
+    console.log(`📞 DIAL RESPONSE DATA:`, JSON.stringify(json, null, 2));
+    
     const humanCallId = json?.data?.call_control_id;
     if (!humanCallId) {
-      await speakToCall(customerCallId, "I’m sorry, we couldn’t reach our representative.");
+      console.log(`❌ NO CALL_CONTROL_ID in dial response`);
+      await speakToCall(customerCallId, "I'm sorry, we couldn't reach our representative.");
       return;
     }
 
+    console.log(`✅ HUMAN CALL INITIATED: ${humanCallId}`);
+    
     const now = new Date().toISOString();
     await upsertFields(customerCallId, { pending_human_call_id: humanCallId });
     await upsertCall({
@@ -562,25 +763,44 @@ async function connectToHuman(customerCallId) {
       linked_customer_call_id: customerCallId,
       human_dial_started_at: now
     });
+    
+    console.log(`📝 DATABASE UPDATED: Human call ${humanCallId} linked to customer ${customerCallId}`);
 
     clearHumanTimeout(customerCallId);
     const t = setTimeout(async () => {
+      console.log(`⏰ HUMAN TIMEOUT TRIGGERED for customer ${customerCallId}`);
+      
       const row = await dbGet('SELECT status, pending_human_call_id FROM calls WHERE call_id = ?', [customerCallId]);
-      if (!row || row.status === 'completed') return;
+      if (!row || row.status === 'completed') {
+        console.log(`⏰ TIMEOUT IGNORED - customer ${customerCallId} already completed`);
+        return;
+      }
 
       const stillPending = row.pending_human_call_id === humanCallId;
-      if (!stillPending) return;
+      if (!stillPending) {
+        console.log(`⏰ TIMEOUT IGNORED - customer ${customerCallId} no longer pending human ${humanCallId}`);
+        return;
+      }
 
-      console.log(`Human leg timeout; hanging up human and asking customer to leave VM. human: ${humanCallId}`);
-      try { await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {}
-      await speakToCall(customerCallId, "I’m sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep.");
+      console.log(`⏰ EXECUTING TIMEOUT: hanging up human ${humanCallId} and prompting customer ${customerCallId} for VM`);
+      try { 
+        await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { 
+          method: 'POST', headers: telnyxHeaders() 
+        }); 
+      } catch (e) {
+        console.error(`❌ ERROR hanging up human on timeout:`, e);
+      }
+      await speakToCall(customerCallId, "I'm sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep.");
       await upsertFields(customerCallId, { pending_human_call_id: null });
     }, 35000);
+    
     humanTimeouts.set(customerCallId, t);
+    console.log(`⏰ HUMAN TIMEOUT SET: 35s for customer ${customerCallId}`);
 
   } catch (e) {
-    console.error('connectToHuman error:', e);
-    await speakToCall(customerCallId, "We’re having trouble connecting. Please call back in a few minutes or leave a message.");
+    console.error(`💥 CONNECT TO HUMAN ERROR:`, e);
+    console.error(`💥 CONNECT TO HUMAN STACK:`, e.stack);
+    await speakToCall(customerCallId, "We're having trouble connecting. Please call back in a few minutes or leave a message.");
   }
 }
 
