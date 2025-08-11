@@ -894,11 +894,23 @@ console.log(')');
 async function scheduleZapierWebhook(callId) {
   try {
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+    
+    // Enhanced logging for Zapier decision
+    console.log(`🔍 ZAPIER CHECK for ${callId}:`);
+    console.log(`   - call_type: ${call?.call_type}`);
+    console.log(`   - status: ${call?.status}`);
+    console.log(`   - direction: ${call?.direction}`);
+    console.log(`   - recording_url: ${call?.recording_url ? 'exists' : 'missing'}`);
+    console.log(`   - zapier_sent: ${call?.zapier_sent}`);
+    
     const shouldSend =
-      (call?.call_type === 'customer_inquiry' || call?.call_type === 'human_connected') &&
+      (call?.call_type === 'customer_inquiry' || 
+       call?.call_type === 'human_connected' || 
+       call?.call_type === 'human_transfer') &&  // ⭐ Added human_transfer to trigger sending
       call?.status === 'completed' &&
       call?.recording_url &&
       !call?.zapier_sent;
+      
     console.log('ZAPIER DECISION →', {
       call_id: callId,
       direction: call?.direction || null,
@@ -908,7 +920,12 @@ async function scheduleZapierWebhook(callId) {
       zapier_sent: !!call?.zapier_sent,
       shouldSend
     });
-    if (!shouldSend) return;
+    
+    if (!shouldSend) {
+      console.log(`❌ ZAPIER SKIP: Not sending webhook for ${callId}`);
+      return;
+    }
+    
     setTimeout(async () => { await sendToZapier(callId); }, 3000);
   } catch (e) { console.error('scheduleZapierWebhook error:', e); }
 }
