@@ -520,20 +520,43 @@ async function onCallInitiated(data, clientState) {
   const to_number = data.payload?.to || data.to;
   const start_time = new Date().toISOString();
 
+  console.log(`🚀 CALL INITIATED: ${call_id}, direction: ${dir}`);
+
   if (dir === 'incoming') {
+    console.log(`📞 INCOMING CALL: ${call_id} from ${from_number}`);
     await upsertCall({
       call_id, direction: 'inbound', from_number, to_number,
       status: 'initiated', start_time, call_type: 'customer_inquiry'
     });
     await answerAndIntro(call_id);
   } else {
-    // Outbound leg (likely human rep)
-    let linked_customer_call_id = clientState?.customer_call_id || null;
-    await upsertCall({
-      call_id, direction: 'outbound', from_number, to_number,
-      status: 'initiated', start_time, call_type: 'human_representative',
-      linked_customer_call_id, human_dial_started_at: start_time
-    });
+    // Outbound leg (likely human rep) - Check if record already exists
+    console.log(`📞 OUTBOUND CALL: ${call_id} to ${to_number}`);
+    
+    const existingRecord = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
+    
+    if (existingRecord) {
+      console.log(`📝 EXISTING RECORD FOUND for ${call_id}, updating status and timing`);
+      console.log(`📝 EXISTING RECORD:`, JSON.stringify(existingRecord, null, 2));
+      
+      // Just update the status and timing, preserve existing data
+      await upsertFields(call_id, {
+        status: 'initiated',
+        start_time,
+        from_number,
+        to_number
+      });
+    } else {
+      console.log(`📝 NO EXISTING RECORD for ${call_id}, this should not happen for human calls`);
+      
+      // Fallback - create basic outbound record
+      let linked_customer_call_id = clientState?.customer_call_id || null;
+      await upsertCall({
+        call_id, direction: 'outbound', from_number, to_number,
+        status: 'initiated', start_time, call_type: 'human_representative',
+        linked_customer_call_id, human_dial_started_at: start_time
+      });
+    }
   }
 }
 
