@@ -578,14 +578,14 @@ async function onCallInitiated(data, clientState) {
     const existingRecord = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
     
     if (existingRecord) {
-      console.log(`📝 EXISTING RECORD FOUND for ${call_id}, updating status and timing`);
+      console.log(`📝 EXISTING RECORD FOUND for ${call_id}, updating ONLY status and timing`);
       console.log(`📝 EXISTING RECORD:`, JSON.stringify(existingRecord, null, 2));
       
-      / ONLY update specific fields, don't touch call_type or linked_customer_call_id
-await dbRun('UPDATE calls SET status = ?, start_time = ?, from_number = ?, to_number = ? WHERE call_id = ?', 
-  ['initiated', start_time, from_number, to_number, call_id]);
-
-console.log(`✅ UPDATED existing record with minimal changes`);
+      // ONLY update specific fields, don't touch call_type or linked_customer_call_id
+      await dbRun('UPDATE calls SET status = ?, start_time = ?, from_number = ?, to_number = ? WHERE call_id = ?', 
+        ['initiated', start_time, from_number, to_number, call_id]);
+      
+      console.log(`✅ UPDATED existing record with minimal changes`);
     } else {
       console.log(`📝 NO EXISTING RECORD for ${call_id}, this should not happen for human calls`);
       
