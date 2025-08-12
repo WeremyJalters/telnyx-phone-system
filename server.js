@@ -285,6 +285,9 @@ async function storeTranscript(call_id, transcriptId, transcriptText) {
   });
 
   console.log('📝 Transcript stored for', call_id, 'URL:', transcriptUrl);
+
+  // Send Zapier webhook now that we have both recording AND transcript
+  await sendZapierWithTranscript(call_id);
 }
 
 // Optional HMAC verification (AAI-Signature). If the service uses a different scheme,
@@ -429,10 +432,81 @@ async function scheduleZapierWebhook(callId) {
       return;
     }
 
-    console.log('📤 ZAPIER: Scheduling webhook in 3 seconds...');
-    setTimeout(async () => { await sendToZapier(callId); }, 3000);
+    console.log('📤 ZAPIER: Scheduling webhook in 3 seconds... (will wait for transcript)');
+    // Note: We'll send the webhook when transcript completes instead
+    // This ensures both recording AND transcript URLs are available
   } catch (e) {
     console.error('scheduleZapierWebhook error:', e);
+  }
+}
+
+// New function to send webhook after transcript is ready
+async function sendZapierWithTranscript(callId) {
+  try {
+    console.log('📤 ZAPIER: Sending webhook with transcript for', callId);
+    
+    if (!ZAPIER_WEBHOOK_URL) {
+      console.log('🔴 ZAPIER: No webhook URL configured');
+      return;
+    }
+
+    const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+    if (!call) {
+      console.log('🔴 ZAPIER: No call record found for', callId);
+      return;
+    }
+
+    // Only send if we haven't sent already and this is an inbound call with recording
+    const shouldSend =
+      call?.recording_url &&
+      !call?.zapier_sent &&
+      call?.direction === 'inbound';
+
+    if (!shouldSend) {
+      console.log('📤 ZAPIER: Skipping transcript webhook - already sent or criteria not met');
+      return;
+    }
+
+    const payload = {
+      call_id: call.call_id,
+      timestamp: new Date().toISOString(),
+      customer_phone: call.from_number,
+      call_duration_seconds: call.duration || 0,
+      call_start_time: call.start_time,
+      call_end_time: call.end_time,
+      call_type: call.call_type,
+      call_status: call.status,
+      recording_url: call.recording_url,
+      transcript_url: call.transcript_url || null,
+      " Transcript URL": call.transcript_url || null,
+      source: 'Water Damage Restoration Phone System',
+      lead_source: 'Inbound Phone Call',
+      business_phone: call.to_number
+    };
+
+    console.log('📤 ZAPIER: Sending payload with transcript:', JSON.stringify(payload, null, 2));
+    console.log('📤 ZAPIER: Webhook URL:', ZAPIER_WEBHOOK_URL);
+
+    const r = await fetch(ZAPIER_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      timeout: 30000
+    });
+
+    const bodyText = await r.text();
+    console.log(`📤 ZAPIER RESP → status: ${r.status}, body: ${bodyText}`);
+
+    if (r.ok) {
+      await upsertFields(callId, { zapier_sent: true, zapier_sent_at: new Date().toISOString() });
+      console.log('✅ ZAPIER: Successfully sent with transcript and marked as sent');
+    } else {
+      console.log('🔴 ZAPIER: Failed, will retry in 30 seconds');
+      setTimeout(async () => { await sendZapierWithTranscript(callId); }, 30000);
+    }
+  } catch (e) {
+    console.error(`🔴 ZAPIER ERROR for ${callId}:`, e);
+    setTimeout(async () => { await sendZapierWithTranscript(callId); }, 60000);
   }
 }
 
@@ -813,8 +887,17 @@ async function onRecordingSaved(data) {
   console.log('🎧 Starting AssemblyAI job...');
   createAAIJob(safeKeySegment(call_id), finalUrl).catch((e) => console.error('AAI create job error:', e));
 
-  // Schedule Zapier after we know we have a recording
+  // Schedule Zapier after we know we have a recording (but will wait for transcript)
   await scheduleZapierWebhook(call_id);
+
+  // Also send immediate webhook as fallback if no transcript is needed
+  setTimeout(async () => {
+    const call = await dbGet('SELECT * FROM calls WHERE call_id = ? AND zapier_sent = 0', [call_id]);
+    if (call && !aaiEnabled()) {
+      console.log('📤 ZAPIER: Sending fallback webhook (no AAI enabled)');
+      await sendToZapier(call_id);
+    }
+  }, 10000); // Wait 10 seconds, then send fallback if transcript hasn't completed
 }
 
 async function onDTMF(data) {
