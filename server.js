@@ -355,14 +355,14 @@ async function storeTranscript(call_id, transcriptId, text) {
   }
 }
 
-// Minimal, validated `webhook_url` + retry without webhook + polling fallback
+// --- replace your existing createAAIJob with this one ---
 async function createAAIJob(call_id, audioUrl) {
   if (!aaiEnabled() || !audioUrl) {
     console.log('AAI: skip (missing key or audioUrl)');
     return null;
   }
 
-  // Validate & build webhook URL (https required)
+  // Build and validate webhook URL (https required)
   let webhookUrl = null;
   try {
     const base = (Config.WEBHOOK_BASE_URL || '').trim();
@@ -370,7 +370,6 @@ async function createAAIJob(call_id, audioUrl) {
       const u = new URL(base);
       if (u.protocol === 'https:') {
         u.pathname = (u.pathname.replace(/\/+$/, '') + '/webhooks/assembly').replace(/\/{2,}/g, '/');
-        // Pass a safe call id as a convenience (we also include metadata server-side)
         u.searchParams.set('call_id', safeKeySegment(call_id));
         webhookUrl = u.toString();
       } else {
@@ -381,102 +380,70 @@ async function createAAIJob(call_id, audioUrl) {
     console.warn('AAI: invalid WEBHOOK_BASE_URL, will fall back to polling:', e?.message);
   }
 
-  // Minimal payload per docs
   const payload = { audio_url: audioUrl };
   if (webhookUrl) payload.webhook_url = webhookUrl;
 
-  const endpoint = 'https://api.assemblyai.com/v2/transcript/'; // trailing slash OK
-  let createJson = null;
-  try {
+  // Try both endpoint forms, no slash first (some regions 405 the trailing slash)
+  const endpoints = [
+    'https://api.assemblyai.com/v2/transcript',   // preferred
+    'https://api.assemblyai.com/v2/transcript/'   // fallback
+  ];
+
+  const tryCreate = async (endpoint, body) => {
     const r = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Authorization': Config.AAI_API_KEY,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(body)
     });
-    createJson = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      console.error('AAI create failed:', { status: r.status, body: createJson, sent: payload });
+    let j = {};
+    try { j = await r.json(); } catch {}
+    return { ok: r.ok, status: r.status, json: j };
+  };
 
-      // Likely invalid webhook schema -> retry without webhook, then poll
-      const msg = (createJson && (createJson.error || createJson.message || '')).toString().toLowerCase();
+  // 1) Try with webhook_url (validated). If schema error, retry without webhook.
+  for (const ep of endpoints) {
+    try {
+      const first = await tryCreate(ep, payload);
+      if (first.ok && first.json?.id) {
+        if (!webhookUrl) pollAAIUntilDone(first.json.id, call_id).catch(() => {});
+        return first.json.id;
+      }
+      // If webhook schema issue, retry once WITHOUT webhook on this same endpoint
+      const msg = (first.json && (first.json.error || first.json.message || '')).toString().toLowerCase();
       const looksWebhooky = msg.includes('endpoint') || msg.includes('schema') || msg.includes('webhook');
       if (webhookUrl && looksWebhooky) {
-        console.warn('AAI: retrying create WITHOUT webhook_url, will poll status…');
-        const r2 = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Authorization': Config.AAI_API_KEY,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ audio_url: audioUrl })
-        });
-        const j2 = await r2.json().catch(() => ({}));
-        if (!r2.ok || !j2.id) {
-          console.error('AAI create retry failed:', { status: r2.status, body: j2 });
-          return null;
+        console.warn(`AAI: ${ep} rejected webhook_url; retrying without webhook and will poll…`);
+        const second = await tryCreate(ep, { audio_url: audioUrl });
+        if (second.ok && second.json?.id) {
+          pollAAIUntilDone(second.json.id, call_id).catch(() => {});
+          return second.json.id;
         }
-        pollAAIUntilDone(j2.id, call_id).catch(() => {});
-        return j2.id;
+        // If that failed too, try the next endpoint form
+        continue;
       }
-      return null;
+
+      // If 405/404 (endpoint form issue), try the next endpoint form
+      if (first.status === 405 || first.status === 404) {
+        console.warn(`AAI: ${ep} returned ${first.status}; trying alternate endpoint form…`);
+        continue;
+      }
+
+      // Other errors: log and try the alternate form
+      console.error('AAI create failed:', { endpoint: ep, status: first.status, body: first.json, sent: payload });
+    } catch (e) {
+      console.error('AAI create exception:', e);
+      // try next endpoint form
     }
-  } catch (e) {
-    console.error('AAI create exception:', e);
-    return null;
   }
 
-  if (!createJson?.id) {
-    console.error('AAI create returned no id:', createJson);
-    return null;
-  }
-
-  // If no webhook in use, poll in the background
-  if (!webhookUrl) {
-    pollAAIUntilDone(createJson.id, call_id).catch(() => {});
-  }
-
-  return createJson.id;
+  // If all attempts failed, give up gracefully
+  console.error('AAI: all create attempts failed for call', call_id);
+  return null;
 }
 
-// Polling fallback when no webhook (or webhook rejected)
-async function pollAAIUntilDone(transcriptId, call_id) {
-  try {
-    const fetchOnce = async () => {
-      const r = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
-        headers: { 'Authorization': Config.AAI_API_KEY }
-      });
-      return r.json();
-    };
-
-    let tries = 0;
-    while (tries < 60) { // ~5 minutes
-      const j = await fetchOnce();
-      if (j.status === 'completed') {
-        const text = j.text || (Array.isArray(j.utterances)
-          ? j.utterances.map(u => {
-              const sp = (typeof u.speaker === 'number') ? `Speaker ${u.speaker}` : (u.speaker || 'Speaker');
-              return `${sp}: ${u.text || ''}`;
-            }).join('\n')
-          : '');
-        await storeTranscript(call_id, transcriptId, text || '');
-        console.log(`AAI poll: completed for ${call_id}`);
-        return;
-      }
-      if (j.status === 'error') {
-        console.error('AAI poll error:', j.error || j);
-        return;
-      }
-      await waitMs(5000);
-      tries++;
-    }
-    console.warn(`AAI poll: timeout for ${call_id} (id=${transcriptId})`);
-  } catch (e) {
-    console.error('AAI poll exception:', e);
-  }
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////
  // In-memory state (timeouts & bridge tracking). Mapping persists in DB.
