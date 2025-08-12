@@ -1,6 +1,6 @@
 // server.js
 // Water Damage Lead System — durable bridging, Spaces mirroring, Zapier, AssemblyAI transcripts
-// Fixed AssemblyAI integration
+// Enhanced with comprehensive debugging
 
 import express from 'express';
 import { fileURLToPath } from 'url';
@@ -60,6 +60,9 @@ const AAI_WEBHOOK_SECRET = process.env.ASSEMBLYAI_WEBHOOK_SECRET || '';
 function aaiEnabled() {
   return !!AAI_API_KEY;
 }
+
+// --------------------------- Zapier (Airtable) --------------------------------
+const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL || '';
 
 // --------------------------- Database (SQLite) --------------------------------
 class DatabaseQueue {
@@ -281,7 +284,7 @@ async function storeTranscript(call_id, transcriptId, transcriptText) {
     notes: transcriptId ? `AssemblyAI transcript ${transcriptId}` : null
   });
 
-  // done — Zapier will be sent based on recording handler; Airtable gets " Transcript URL" (below)
+  console.log('📝 Transcript stored for', call_id, 'URL:', transcriptUrl);
 }
 
 // Optional HMAC verification (AAI-Signature). If the service uses a different scheme,
@@ -392,6 +395,102 @@ async function createAAIJob(call_id, audioUrl) {
     console.error('🔴 AAI: Create exception:', error);
     await upsertFields(call_id, { notes: `AAI exception: ${error.message}` });
     return null;
+  }
+}
+
+// Enhanced Zapier webhook with comprehensive debugging
+async function scheduleZapierWebhook(callId) {
+  try {
+    console.log('📤 ZAPIER: Checking if should send webhook for', callId);
+    
+    const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+    console.log('📤 ZAPIER: Call data:', {
+      recording_url: !!call?.recording_url,
+      zapier_sent: call?.zapier_sent,
+      direction: call?.direction,
+      call_type: call?.call_type
+    });
+
+    const shouldSend =
+      call?.recording_url &&
+      !call?.zapier_sent &&
+      call?.direction === 'inbound';
+
+    console.log('📤 ZAPIER: Should send?', shouldSend);
+    console.log('📤 ZAPIER: Webhook URL configured?', !!ZAPIER_WEBHOOK_URL);
+
+    if (!shouldSend) {
+      console.log('📤 ZAPIER: Skipping - criteria not met');
+      return;
+    }
+
+    if (!ZAPIER_WEBHOOK_URL) {
+      console.log('🔴 ZAPIER: No webhook URL configured - skipping');
+      return;
+    }
+
+    console.log('📤 ZAPIER: Scheduling webhook in 3 seconds...');
+    setTimeout(async () => { await sendToZapier(callId); }, 3000);
+  } catch (e) {
+    console.error('scheduleZapierWebhook error:', e);
+  }
+}
+
+async function sendToZapier(callId) {
+  try {
+    console.log('📤 ZAPIER: Starting webhook send for', callId);
+    
+    if (!ZAPIER_WEBHOOK_URL) {
+      console.log('🔴 ZAPIER: No webhook URL configured');
+      return;
+    }
+
+    const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
+    if (!call) {
+      console.log('🔴 ZAPIER: No call record found for', callId);
+      return;
+    }
+
+    const payload = {
+      call_id: call.call_id,
+      timestamp: new Date().toISOString(),
+      customer_phone: call.from_number,
+      call_duration_seconds: call.duration || 0,
+      call_start_time: call.start_time,
+      call_end_time: call.end_time,
+      call_type: call.call_type,
+      call_status: call.status,
+      recording_url: call.recording_url,
+      transcript_url: call.transcript_url || null,
+      " Transcript URL": call.transcript_url || null,
+      source: 'Water Damage Restoration Phone System',
+      lead_source: 'Inbound Phone Call',
+      business_phone: call.to_number
+    };
+
+    console.log('📤 ZAPIER: Sending payload:', JSON.stringify(payload, null, 2));
+    console.log('📤 ZAPIER: Webhook URL:', ZAPIER_WEBHOOK_URL);
+
+    const r = await fetch(ZAPIER_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      timeout: 30000
+    });
+
+    const bodyText = await r.text();
+    console.log(`📤 ZAPIER RESP → status: ${r.status}, body: ${bodyText}`);
+
+    if (r.ok) {
+      await upsertFields(callId, { zapier_sent: true, zapier_sent_at: new Date().toISOString() });
+      console.log('✅ ZAPIER: Successfully sent and marked as sent');
+    } else {
+      console.log('🔴 ZAPIER: Failed, will retry in 30 seconds');
+      setTimeout(async () => { await sendToZapier(callId); }, 30000);
+    }
+  } catch (e) {
+    console.error(`🔴 ZAPIER ERROR for ${callId}:`, e);
+    setTimeout(async () => { await sendToZapier(callId); }, 60000);
   }
 }
 
@@ -808,71 +907,6 @@ async function connectToHuman(customerCallId) {
   }
 }
 
-// --------------------------- Zapier (Airtable) --------------------------------
-const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL || '';
-
-async function scheduleZapierWebhook(callId) {
-  try {
-    const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-
-    const shouldSend =
-      call?.recording_url &&
-      !call?.zapier_sent &&
-      call?.direction === 'inbound';
-
-    if (!shouldSend) return;
-
-    setTimeout(async () => { await sendToZapier(callId); }, 3000);
-  } catch (e) {
-    console.error('scheduleZapierWebhook error:', e);
-  }
-}
-
-async function sendToZapier(callId) {
-  try {
-    if (!ZAPIER_WEBHOOK_URL) return;
-
-    const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-    if (!call) return;
-
-    const payload = {
-      call_id: call.call_id,
-      timestamp: new Date().toISOString(),
-      customer_phone: call.from_number,
-      call_duration_seconds: call.duration || 0,
-      call_start_time: call.start_time,
-      call_end_time: call.end_time,
-      call_type: call.call_type,
-      call_status: call.status,
-      recording_url: call.recording_url,
-      transcript_url: call.transcript_url || null,                // keep existing field
-      " Transcript URL": call.transcript_url || null,             // Airtable column with leading space
-      source: 'Water Damage Restoration Phone System',
-      lead_source: 'Inbound Phone Call',
-      business_phone: call.to_number
-    };
-
-    const r = await fetch(ZAPIER_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      timeout: 30000
-    });
-
-    const bodyText = await r.text();
-    console.log(`ZAPIER RESP → status: ${r.status}, body: ${bodyText}`);
-
-    if (r.ok) {
-      await upsertFields(callId, { zapier_sent: true, zapier_sent_at: new Date().toISOString() });
-    } else {
-      setTimeout(async () => { await sendToZapier(callId); }, 30000);
-    }
-  } catch (e) {
-    console.error(`ZAPIER ERROR for ${callId}:`, e);
-    setTimeout(async () => { await sendToZapier(callId); }, 60000);
-  }
-}
-
 // ---------------------------- Static / Health --------------------------------
 app.use(express.static(join(__dirname, 'public')));
 
@@ -900,6 +934,8 @@ async function startServer() {
       console.log(`Recorded prompts enabled: ${USE_RECORDED_PROMPTS}`);
       console.log(`Database path: ${dbPath}`);
       console.log(`AssemblyAI enabled: ${aaiEnabled()}`);
+      console.log(`Zapier webhook configured: ${!!ZAPIER_WEBHOOK_URL}`);
+      if (ZAPIER_WEBHOOK_URL) console.log(`Zapier URL: ${ZAPIER_WEBHOOK_URL}`);
     });
 
     const shutdown = (sig) => {
