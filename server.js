@@ -1,6 +1,6 @@
 // server.js
 // Water Damage Lead System — durable bridging, Spaces mirroring, Zapier, AssemblyAI transcripts
-// Reflowed for clarity; preserves previous behavior.
+// Fixed AssemblyAI integration
 
 import express from 'express';
 import { fileURLToPath } from 'url';
@@ -303,13 +303,16 @@ function verifyAAISignature(rawBody, signatureHeader, secret) {
 
 // Polling fallback if webhook not accepted
 async function pollAAIUntilDone(transcriptId, call_id) {
+  console.log(`🔄 AAI: Starting polling for transcript ${transcriptId}`);
   for (let i = 0; i < 60; i++) {
     await waitMs(5000);
     try {
       const r = await fetch(`https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}`, {
-        headers: { 'Authorization': AAI_API_KEY }
+        headers: { 'authorization': AAI_API_KEY }
       });
       const j = await r.json();
+      console.log(`🔄 AAI: Poll ${i+1}/60 - Status: ${j.status}`);
+      
       if (j.status === 'completed') {
         let text = j.text || '';
         if ((!text || text.trim().length < 5) && Array.isArray(j.utterances)) {
@@ -331,111 +334,66 @@ async function pollAAIUntilDone(transcriptId, call_id) {
       console.error('AAI poll exception:', e);
     }
   }
+  console.error('🔴 AAI: Polling timeout after 300 seconds for', call_id);
 }
 
-// Robust create that tries both endpoint forms and falls back to polling if webhook rejected
+// Fixed AssemblyAI create function
 async function createAAIJob(call_id, audioUrl) {
-  if (!aaiEnabled() || !audioUrl) return null;
-
-  // Build webhook URL (https only). If anything looks off, we simply don't set it and we'll poll.
-  let webhookUrl = null;
-  try {
-    if (WEBHOOK_BASE_URL) {
-      const u = new URL(WEBHOOK_BASE_URL);
-      if (u.protocol === 'https:') {
-        u.pathname = (u.pathname.replace(/\/+$/, '') + '/webhooks/assembly').replace(/\/{2,}/g, '/');
-        u.searchParams.set('call_id', safeKeySegment(call_id));
-        webhookUrl = u.toString();
-      } else {
-        console.warn(`AAI: WEBHOOK_BASE_URL must be https:// (got ${u.protocol}) — falling back to polling`);
-      }
-    }
-  } catch (e) {
-    console.warn('AAI: invalid WEBHOOK_BASE_URL — falling back to polling:', e?.message);
+  if (!aaiEnabled() || !audioUrl) {
+    console.log('AAI: Skipping - not enabled or no audio URL');
+    return null;
   }
 
-  const baseBody = {
+  console.log('🎧 AAI: Creating transcript job for', call_id);
+  console.log('🎧 AAI: Audio URL:', audioUrl);
+
+  // Always use polling for now to avoid webhook issues
+  const payload = {
     audio_url: audioUrl,
-    metadata: JSON.stringify({ call_id })
+    speaker_labels: true,
+    punctuate: true,
+    format_text: true
   };
 
-  if (webhookUrl) baseBody.webhook_url = webhookUrl;
-  if (AAI_WEBHOOK_SECRET) {
-    baseBody.webhook_auth_header_name = 'Authorization';
-    baseBody.webhook_auth_header_value = `Bearer ${AAI_WEBHOOK_SECRET}`;
-  }
-
-  // Try multiple endpoint spellings; some accounts still accept /transcripts
-  const endpoints = [
-    'https://api.assemblyai.com/v2/transcript',
-    'https://api.assemblyai.com/v2/transcripts'
-  ];
-
-  const postJson = async (endpoint, body, label) => {
-    const r = await fetch(endpoint, {
+  try {
+    const response = await fetch('https://api.assemblyai.com/v2/transcript', {
       method: 'POST',
-      headers: { 'Authorization': AAI_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      headers: {
+        'authorization': AAI_API_KEY,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(payload)
     });
-    let text = await r.text();
-    let j = null;
-    try { j = JSON.parse(text); } catch { /* keep raw text for logging */ }
-    return { ok: r.ok, status: r.status, json: j, raw: text, endpoint, label };
-  };
 
-  console.log('AAI: creating transcript job for', call_id);
-  for (const ep of endpoints) {
-    // 1) try with webhook (if we built one)
-    if (webhookUrl) {
-      const res1 = await postJson(ep, baseBody, 'with-webhook');
-      if (res1.ok && res1.json?.id) {
-        console.log(`AAI create OK at ${ep} (webhook), id=${res1.json.id}`);
-        return res1.json.id; // webhook will deliver transcript
-      }
-      const msg = (res1.json?.error || res1.json?.message || res1.raw || '').toString();
-      if (/endpoint|schema|webhook/i.test(msg)) {
-        console.warn(`AAI: ${ep} rejected webhook_url; will retry without webhook and poll…`);
-      } else if (res1.status === 401) {
-        console.error('AAI 401 Unauthorized. Check ASSEMBLYAI_API_KEY value.');
-        console.error('AAI RESP:', { status: res1.status, body: res1.raw });
-        return null;
-      } else {
-        console.warn('AAI create (webhook) failed:', { endpoint: ep, status: res1.status, body: res1.raw });
-      }
-    }
-
-    // 2) try without webhook (always poll on success)
-    const bodyNoHook = { ...baseBody };
-    delete bodyNoHook.webhook_url;
-    delete bodyNoHook.webhook_auth_header_name;
-    delete bodyNoHook.webhook_auth_header_value;
-
-    const res2 = await postJson(ep, bodyNoHook, 'no-webhook');
-    if (res2.ok && res2.json?.id) {
-      console.log(`AAI create OK at ${ep} (no webhook), id=${res2.json.id} — polling until done`);
-      pollAAIUntilDone(res2.json.id, call_id).catch(() => {});
-      return res2.json.id;
-    }
-
-    if (res2.status === 401) {
-      console.error('AAI 401 Unauthorized. Check ASSEMBLYAI_API_KEY value.');
-      console.error('AAI RESP:', { status: res2.status, body: res2.raw });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('🔴 AAI: Create failed -', response.status, errorText);
+      await upsertFields(call_id, { notes: `AAI create failed: ${response.status} ${errorText}` });
       return null;
     }
 
-    // some clusters send 404/405 when a specific path form is wrong; loop will try next ep
-    if (res2.status === 404 || res2.status === 405) {
-      console.warn(`AAI: ${ep} returned ${res2.status}; trying next endpoint form…`);
-      continue;
+    const result = await response.json();
+    const transcriptId = result.id;
+    
+    if (!transcriptId) {
+      console.error('🔴 AAI: No transcript ID in response:', result);
+      return null;
     }
 
-    console.error('AAI create failed:', { endpoint: ep, status: res2.status, body: res2.raw, sent: bodyNoHook });
+    console.log('✅ AAI: Transcript created successfully -', transcriptId);
+    
+    // Start polling
+    pollAAIUntilDone(transcriptId, call_id).catch(e => {
+      console.error('🔴 AAI: Polling error:', e);
+    });
+
+    return transcriptId;
+  } catch (error) {
+    console.error('🔴 AAI: Create exception:', error);
+    await upsertFields(call_id, { notes: `AAI exception: ${error.message}` });
+    return null;
   }
-
-  console.error('AAI: all create attempts failed for call', call_id);
-  return null;
 }
-
 
 // ----------------------------- State (Timers) --------------------------------
 const humanTimeouts = new Map(); // key: customerCallId -> timeoutId
@@ -529,7 +487,7 @@ app.post('/webhooks/assembly', express.raw({ type: '*/*' }), async (req, res) =>
     let result;
     try {
       const r = await fetch(`https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}`, {
-        headers: { 'Authorization': AAI_API_KEY }
+        headers: { 'authorization': AAI_API_KEY }
       });
       result = await r.json();
       if (!r.ok) throw new Error(result?.error || `GET /transcript/${transcriptId} failed`);
@@ -738,17 +696,22 @@ async function onRecordingSaved(data) {
   const telnyxUrl = data.payload?.recording_urls?.mp3 || data.recording_urls?.mp3;
   let finalUrl = telnyxUrl;
 
+  console.log('📹 Recording saved for call:', call_id);
+  console.log('📹 Telnyx URL:', telnyxUrl);
+
   try {
     await dbRun('BEGIN IMMEDIATE');
     finalUrl = await mirrorRecordingToSpaces(call_id, telnyxUrl);
     await upsertFields(call_id, { recording_url: finalUrl, status: 'completed' });
     await dbRun('COMMIT');
+    console.log('📹 Recording mirrored to:', finalUrl);
   } catch (e) {
     try { await dbRun('ROLLBACK'); } catch {}
     console.error('Recording save DB error:', e);
   }
 
   // Fire AssemblyAI (webhook or polling)
+  console.log('🎧 Starting AssemblyAI job...');
   createAAIJob(safeKeySegment(call_id), finalUrl).catch((e) => console.error('AAI create job error:', e));
 
   // Schedule Zapier after we know we have a recording
@@ -936,6 +899,7 @@ async function startServer() {
       console.log(`Telnyx #: ${TELNYX_PHONE_NUMBER} | Human #: ${HUMAN_PHONE_NUMBER}`);
       console.log(`Recorded prompts enabled: ${USE_RECORDED_PROMPTS}`);
       console.log(`Database path: ${dbPath}`);
+      console.log(`AssemblyAI enabled: ${aaiEnabled()}`);
     });
 
     const shutdown = (sig) => {
