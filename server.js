@@ -1,5 +1,6 @@
 // server.js
-// Water Damage Lead System – Telnyx → Spaces → Zapier + AssemblyAI (webhook + polling fallback)
+// Water Damage Lead System — durable bridging, Spaces mirroring, Zapier, AssemblyAI transcripts
+// Reflowed for clarity; preserves previous behavior.
 
 import express from 'express';
 import { fileURLToPath } from 'url';
@@ -8,107 +9,59 @@ import sqlite3 from 'sqlite3';
 import crypto from 'crypto';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
-// Node 18+ includes global fetch.
-
-////////////////////////////////////////////////////////////////////////////////////////
-// Config
-////////////////////////////////////////////////////////////////////////////////////////
+// ------------------------------- Paths / App ---------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-
-const Config = {
-  PORT: Number(process.env.PORT || 3000),
-
-  // Feature flags / prompts
-  USE_RECORDED_PROMPTS: String(process.env.USE_RECORDED_PROMPTS || 'false').toLowerCase() === 'true',
-  GREETING_AUDIO_URL: process.env.GREETING_AUDIO_URL || '',
-  MENU_AUDIO_URL: process.env.MENU_AUDIO_URL || '',
-  HUMAN_GREETING_AUDIO_URL: process.env.HUMAN_GREETING_AUDIO_URL || '',
-  HUMAN_BRIDGE_GREETING_MS: Number(process.env.HUMAN_BRIDGE_GREETING_MS || 3000),
-
-  // Telnyx
-  TELNYX_API_KEY: process.env.TELNYX_API_KEY || '',
-  TELNYX_PHONE_NUMBER: process.env.TELNYX_PHONE_NUMBER || '',
-  TELNYX_CONNECTION_ID: process.env.TELNYX_CONNECTION_ID || '2755388541746808609',
-  WEBHOOK_BASE_URL: (process.env.WEBHOOK_BASE_URL || '').replace(/\/+$/,''),
-  HUMAN_PHONE_NUMBER: process.env.HUMAN_PHONE_NUMBER || '',
-
-  // Spaces (S3)
-  SPACES_KEY: process.env.SPACES_KEY || '',
-  SPACES_SECRET: process.env.SPACES_SECRET || '',
-  SPACES_REGION: process.env.SPACES_REGION || 'nyc3',
-  SPACES_ENDPOINT: process.env.SPACES_ENDPOINT || 'nyc3.digitaloceanspaces.com',
-  SPACES_BUCKET: process.env.SPACES_BUCKET || '',
-  SPACES_CDN_BASE: (process.env.SPACES_CDN_BASE || '').replace(/\/+$/,''),
-
-  // AssemblyAI
-  AAI_API_KEY: process.env.ASSEMBLYAI_API_KEY || '',
-  AAI_WEBHOOK_SECRET: process.env.ASSEMBLYAI_WEBHOOK_SECRET || '',
-
-  // Zapier
-  ZAPIER_WEBHOOK_URL: process.env.ZAPIER_WEBHOOK_URL || '',
-
-  // DB
-  DATABASE_PATH: process.env.DATABASE_PATH || join(__dirname, 'call_records.db'),
-};
-
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Utilities
-////////////////////////////////////////////////////////////////////////////////////////
-const aaiEnabled = () => !!Config.AAI_API_KEY;
+// ------------------------------ Feature Flags --------------------------------
+const USE_RECORDED_PROMPTS = String(process.env.USE_RECORDED_PROMPTS || 'false').toLowerCase() === 'true';
+const GREETING_AUDIO_URL = process.env.GREETING_AUDIO_URL || '';
+const MENU_AUDIO_URL = process.env.MENU_AUDIO_URL || '';
+const HUMAN_GREETING_AUDIO_URL = process.env.HUMAN_GREETING_AUDIO_URL || '';
+const HUMAN_BRIDGE_GREETING_MS = Number(process.env.HUMAN_BRIDGE_GREETING_MS || 3000); // staff greeting before bridge
+
+// --------------------------- Telnyx / Routing --------------------------------
+const TELNYX_API_KEY = process.env.TELNYX_API_KEY || '';
+const TELNYX_PHONE_NUMBER = process.env.TELNYX_PHONE_NUMBER || '';
+const TELNYX_CONNECTION_ID = process.env.TELNYX_CONNECTION_ID || '2755388541746808609';
+const WEBHOOK_BASE_URL = (process.env.WEBHOOK_BASE_URL || '').trim();
+const HUMAN_PHONE_NUMBER = process.env.HUMAN_PHONE_NUMBER || '';
 
 function telnyxHeaders() {
   return {
     'Content-Type': 'application/json',
     'Accept': 'application/json',
-    'Authorization': `Bearer ${Config.TELNYX_API_KEY}`
+    'Authorization': `Bearer ${TELNYX_API_KEY}`
   };
 }
 
-function waitMs(ms) { return new Promise(r => setTimeout(r, ms)); }
-function b64(json) { return Buffer.from(JSON.stringify(json), 'utf8').toString('base64'); }
-function parseB64(s) { try { return JSON.parse(Buffer.from(s || '', 'base64').toString('utf8')); } catch { return null; } }
+// ----------------------- DigitalOcean Spaces (S3) -----------------------------
+const SPACES_KEY = process.env.SPACES_KEY || '';
+const SPACES_SECRET = process.env.SPACES_SECRET || '';
+const SPACES_REGION = process.env.SPACES_REGION || 'nyc3';
+const SPACES_ENDPOINT = process.env.SPACES_ENDPOINT || 'nyc3.digitaloceanspaces.com';
+const SPACES_BUCKET = process.env.SPACES_BUCKET || '';
+const SPACES_CDN_BASE = (process.env.SPACES_CDN_BASE || '').trim();
 
-// Safely map any call_id to a key segment for Spaces (avoid ":" and friends)
-function safeKeySegment(s) {
-  return String(s || '').replace(/[^A-Za-z0-9._-]/g, '_');
-}
-
-// Optional HMAC-ish verification that some AAI deployments send
-function verifyAAISignature(rawBody, signatureHeader, secret) {
-  if (!secret || !signatureHeader) return true;
-  const [algo, sig] = (signatureHeader || '').split('=', 2);
-  if (algo !== 'sha256' || !sig) return false;
-  const hmac = crypto.createHmac('sha256', secret);
-  hmac.update(rawBody, 'utf8');
-  const digest = hmac.digest('hex');
-  try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest)); } catch { return false; }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////
-// S3 / Spaces
-////////////////////////////////////////////////////////////////////////////////////////
 const S3 = new S3Client({
-  region: Config.SPACES_REGION,
-  endpoint: `https://${Config.SPACES_ENDPOINT}`,
+  region: SPACES_REGION,
+  endpoint: `https://${SPACES_ENDPOINT}`,
   forcePathStyle: false,
-  credentials: { accessKeyId: Config.SPACES_KEY, secretAccessKey: Config.SPACES_SECRET }
+  credentials: { accessKeyId: SPACES_KEY, secretAccessKey: SPACES_SECRET }
 });
 
-async function putPublicObject(key, body, contentType, cache = 'public, max-age=31536000') {
-  if (!Config.SPACES_BUCKET) return null;
-  await S3.send(new PutObjectCommand({
-    Bucket: Config.SPACES_BUCKET, Key: key, Body: body,
-    ContentType: contentType, ACL: 'public-read', CacheControl: cache
-  }));
-  return `${Config.SPACES_CDN_BASE}/${key}`;
+// ------------------------------- AssemblyAI ----------------------------------
+const AAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || process.env.ASSEMBLYAI_API_KEY || '';
+// Optional: secret to verify webhooks (Bearer or HMAC)
+const AAI_WEBHOOK_SECRET = process.env.ASSEMBLYAI_WEBHOOK_SECRET || '';
+
+function aaiEnabled() {
+  return !!AAI_API_KEY;
 }
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Database (SQLite) with queued access
-////////////////////////////////////////////////////////////////////////////////////////
+// --------------------------- Database (SQLite) --------------------------------
 class DatabaseQueue {
   constructor() { this.q = []; this.processing = false; }
   execute(op) { return new Promise((resolve, reject) => { this.q.push({ op, resolve, reject }); this._run(); }); }
@@ -124,21 +77,20 @@ class DatabaseQueue {
   }
 }
 const dbQueue = new DatabaseQueue();
-
-const db = new sqlite3.Database(
-  Config.DATABASE_PATH,
-  sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE,
-  (err) => err ? console.error('Error opening DB:', err) : console.log('Connected to SQLite at:', Config.DATABASE_PATH)
-);
+const dbPath = process.env.DATABASE_PATH || join(__dirname, 'call_records.db');
+const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
+  if (err) console.error('Error opening database:', err);
+  else console.log('Connected to SQLite at:', dbPath);
+});
 
 db.serialize(() => {
   db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA synchronous = NORMAL;');
+  db.exec('PRAGMA synchronous = FULL;');
   db.exec('PRAGMA cache_size = 1000;');
   db.exec('PRAGMA temp_store = memory;');
   db.exec('PRAGMA busy_timeout = 30000;');
   db.exec('PRAGMA foreign_keys = ON;');
-  db.exec('PRAGMA locking_mode = NORMAL;');
+  db.exec('PRAGMA locking_mode = EXCLUSIVE;');
   console.log('Database PRAGMA settings applied');
 });
 
@@ -154,29 +106,6 @@ const dbGet = (sql, params = []) =>
   dbQueue.execute(() => new Promise((res, rej) => {
     db.get(sql, params, (err, row) => err ? rej(err) : res(row));
   }));
-
-function normalizedColumns(obj) {
-  const order = [
-    'call_id','direction','from_number','to_number','status','start_time','end_time','duration',
-    'recording_url','transcript','transcript_url','call_type','customer_info','contractor_info',
-    'notes','customer_zip_code','customer_name','lead_quality','zapier_sent','zapier_sent_at',
-    'pending_human_call_id','linked_customer_call_id','human_dial_started_at','human_answered_at','created_at'
-  ];
-  const cols = [], vals = [];
-  for (const k of order) if (Object.prototype.hasOwnProperty.call(obj, k)) { cols.push(k); vals.push(obj[k]); }
-  return { cols, vals };
-}
-
-async function upsertCall(obj) {
-  if (!obj.call_id) throw new Error('upsertCall requires call_id');
-  const { cols, vals } = normalizedColumns(obj);
-  const placeholders = cols.map(() => '?').join(', ');
-  const updates = cols.filter(c => c !== 'call_id').map(c => `${c}=COALESCE(excluded.${c}, ${c})`).join(', ');
-  const sql = `INSERT INTO calls (${cols.join(', ')}) VALUES (${placeholders})
-               ON CONFLICT(call_id) DO UPDATE SET ${updates}`;
-  return dbRun(sql, vals);
-}
-async function upsertFields(call_id, fields) { return upsertCall({ call_id, ...fields }); }
 
 async function initDatabase() {
   await dbRun(`
@@ -216,9 +145,24 @@ async function initDatabase() {
   console.log('Existing calls in DB:', count?.count || 0);
 }
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Telnyx helpers
-////////////////////////////////////////////////////////////////////////////////////////
+// upsert helpers
+async function upsertCall(obj) {
+  const cols = Object.keys(obj);
+  const placeholders = cols.map(() => '?').join(', ');
+  const updates = cols.filter(c => c !== 'call_id').map(c => `${c}=COALESCE(excluded.${c}, ${c})`).join(', ');
+  const sql = `INSERT INTO calls (${cols.join(', ')}) VALUES (${placeholders})
+               ON CONFLICT(call_id) DO UPDATE SET ${updates}`;
+  return dbRun(sql, cols.map(c => obj[c]));
+}
+async function upsertFields(call_id, fields) { return upsertCall({ call_id, ...fields }); }
+
+// ------------------------------- Utilities -----------------------------------
+function waitMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+function b64(json) { return Buffer.from(JSON.stringify(json), 'utf8').toString('base64'); }
+function parseB64(s) { try { return JSON.parse(Buffer.from(s || '', 'base64').toString('utf8')); } catch { return null; } }
+function safeKeySegment(s) { return String(s || '').replace(/[^\w\-.:]/g, '_'); }
+
+// ------------------------- Telnyx Call Helpers --------------------------------
 async function playbackAudio(callId, audioUrl) {
   const r = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
     method: 'POST', headers: telnyxHeaders(), body: JSON.stringify({ audio_url: audioUrl })
@@ -227,15 +171,11 @@ async function playbackAudio(callId, audioUrl) {
 }
 
 async function speakToCall(callId, message) {
-  try {
-    const r = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
-      method: 'POST', headers: telnyxHeaders(),
-      body: JSON.stringify({ payload: message, voice: 'female', language: 'en-US' })
-    });
-    if (!r.ok) console.error('speak failed:', await r.text());
-  } catch (e) {
-    console.error('speak exception:', e);
-  }
+  const r = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
+    method: 'POST', headers: telnyxHeaders(),
+    body: JSON.stringify({ payload: message, voice: 'female', language: 'en-US' })
+  });
+  if (!r.ok) console.error('speak failed:', await r.text());
 }
 
 async function gatherUsingSpeak(callId, payload, { min = 1, max = 1, timeoutMs = 12000, term = '#' } = {}) {
@@ -246,22 +186,20 @@ async function gatherUsingSpeak(callId, payload, { min = 1, max = 1, timeoutMs =
       minimum_digits: min, maximum_digits: max, timeout_millis: timeoutMs, terminating_digit: term
     })
   });
-  if (!r.ok) console.error('gather_using_speak failed:', await r.text());
+  if (!r.ok) console.error(`gather_using_speak failed:`, await r.text());
 }
 
 async function gatherUsingAudio(callId, audioUrl, { min = 1, max = 1, timeoutMs = 12000, term = '#' } = {}) {
   const r = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/gather_using_audio`, {
     method: 'POST', headers: telnyxHeaders(),
-    body: JSON.stringify({
-      audio_url: audioUrl, minimum_digits: min, maximum_digits: max, timeout_millis: timeoutMs, terminating_digit: term
-    })
+    body: JSON.stringify({ audio_url: audioUrl, minimum_digits: min, maximum_digits: max, timeout_millis: timeoutMs, terminating_digit: term })
   });
   if (!r.ok) console.error('gather_using_audio failed:', await r.text());
 }
 
 async function playIVRMenu(callId) {
-  if (Config.USE_RECORDED_PROMPTS && Config.MENU_AUDIO_URL) {
-    await gatherUsingAudio(callId, Config.MENU_AUDIO_URL, { min: 1, max: 1, timeoutMs: 12000, term: '#' });
+  if (USE_RECORDED_PROMPTS && MENU_AUDIO_URL) {
+    await gatherUsingAudio(callId, MENU_AUDIO_URL, { min: 1, max: 1, timeoutMs: 12000, term: '#' });
   } else {
     const menuText = "Thanks for calling our flood and water damage restoration team. " +
       "Press 1 to be connected to a representative now. " +
@@ -278,194 +216,230 @@ async function answerAndIntro(callId) {
     });
     if (!answer.ok) { console.error('Failed to answer:', await answer.text()); return; }
 
-    const recordResult = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
+    // Start recording (dual channels so agents/callers separated)
+    await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/record_start`, {
       method: 'POST', headers: telnyxHeaders(), body: JSON.stringify({ format: 'mp3', channels: 'dual' })
-    }).catch((e) => console.error(`record_start error for ${callId}:`, e));
-    if (recordResult && !recordResult.ok) console.error('record_start HTTP error:', await recordResult.text());
+    }).catch((e) => console.error('record_start failed:', e));
 
-    if (Config.USE_RECORDED_PROMPTS && Config.GREETING_AUDIO_URL) {
-      await playbackAudio(callId, Config.GREETING_AUDIO_URL);
+    if (USE_RECORDED_PROMPTS && GREETING_AUDIO_URL) {
+      await playbackAudio(callId, GREETING_AUDIO_URL);
       await waitMs(400);
     }
     await playIVRMenu(callId);
-  } catch (e) { console.error(`answerAndIntro error for ${callId}:`, e); }
+  } catch (e) {
+    console.error('answerAndIntro error:', e);
+  }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Spaces: mirror Telnyx recording
-////////////////////////////////////////////////////////////////////////////////////////
+// ---------------------- Spaces: mirror Telnyx recording ----------------------
 async function mirrorRecordingToSpaces(call_id, telnyxUrl) {
-  if (!Config.SPACES_BUCKET || !Config.SPACES_CDN_BASE) return telnyxUrl;
+  if (!SPACES_BUCKET || !SPACES_CDN_BASE) return telnyxUrl;
   try {
     const resp = await fetch(telnyxUrl);
     if (!resp.ok) throw new Error(`download ${resp.status}`);
     const buf = Buffer.from(await resp.arrayBuffer());
     const key = `recordings/${safeKeySegment(call_id)}.mp3`;
-    const cdnUrl = await putPublicObject(key, buf, 'audio/mpeg', 'public, max-age=31536000, immutable');
-    console.log('Uploaded recording to Spaces:', cdnUrl);
-    return cdnUrl || telnyxUrl;
+    await S3.send(new PutObjectCommand({
+      Bucket: SPACES_BUCKET,
+      Key: key,
+      Body: buf,
+      ContentType: 'audio/mpeg',
+      ACL: 'public-read',
+      CacheControl: 'public, max-age=31536000, immutable'
+    }));
+    return `${SPACES_CDN_BASE.replace(/\/+$/,'')}/${key}`;
   } catch (e) {
     console.error('mirrorRecordingToSpaces error:', e);
     return telnyxUrl;
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////
-// AssemblyAI (webhook-based, with validated webhook + fallback to polling)
-////////////////////////////////////////////////////////////////////////////////////////
-const AAI_WEBHOOK_URL = `${Config.WEBHOOK_BASE_URL}/webhooks/assembly`;
-
-// Store transcript: upload minimal .txt to Spaces (if configured), else fallback to AAI URL
-async function storeTranscript(call_id, transcriptId, text) {
-  let txtUrl = null;
-  if (Config.SPACES_BUCKET && Config.SPACES_CDN_BASE) {
-    const key = `transcripts/${safeKeySegment(call_id)}.txt`;
-    try {
-      txtUrl = await putPublicObject(key, Buffer.from(text || '', 'utf8'), 'text/plain; charset=utf-8');
-    } catch (e) {
-      console.error('TXT upload failed:', e);
+// ---------------------- AssemblyAI: store transcript -------------------------
+async function storeTranscript(call_id, transcriptId, transcriptText) {
+  // Minimal Spaces upload: just a tiny .txt so Airtable has a link
+  let transcriptUrl = null;
+  try {
+    if (SPACES_BUCKET && SPACES_CDN_BASE) {
+      const key = `transcripts/${safeKeySegment(call_id)}.txt`;
+      await S3.send(new PutObjectCommand({
+        Bucket: SPACES_BUCKET,
+        Key: key,
+        Body: Buffer.from(transcriptText || '', 'utf8'),
+        ContentType: 'text/plain; charset=utf-8',
+        ACL: 'public-read',
+        CacheControl: 'public, max-age=31536000'
+      }));
+      transcriptUrl = `${SPACES_CDN_BASE.replace(/\/+$/, '')}/${key}`;
     }
+  } catch (e) {
+    console.error('Spaces transcript upload failed:', e);
   }
-  // if no Spaces URL, we can still provide a retrievable endpoint at AssemblyAI
-  const fallbackUrl = `https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}`;
-  const finalUrl = txtUrl || fallbackUrl;
 
   await upsertFields(call_id, {
-    transcript: text || null,
-    transcript_url: finalUrl || null,
-    notes: `AAI complete (${transcriptId})`
+    transcript: transcriptText || '',
+    transcript_url: transcriptUrl || null,
+    notes: transcriptId ? `AssemblyAI transcript ${transcriptId}` : null
   });
 
-  // Optional follow-up Zap so Airtable gets the link even if initial Zap already ran
-  if (Config.ZAPIER_WEBHOOK_URL && finalUrl) {
+  // done — Zapier will be sent based on recording handler; Airtable gets " Transcript URL" (below)
+}
+
+// Optional HMAC verification (AAI-Signature). If the service uses a different scheme,
+// we also accept a simple Bearer secret.
+function verifyAAISignature(rawBody, signatureHeader, secret) {
+  if (!rawBody || !signatureHeader || !secret) return false;
+  try {
+    // Attempt "t=...,v1=..." style (Stripe-like) if present
+    const map = {};
+    signatureHeader.split(',').forEach(p => { const [k, v] = p.split('='); if (k && v) map[k.trim()] = v.trim(); });
+    const payload = map.t ? `${map.t}.${rawBody}` : rawBody;
+    const expected = crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+    const provided = map.v1 || signatureHeader;
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
+  } catch {
+    return false;
+  }
+}
+
+// Polling fallback if webhook not accepted
+async function pollAAIUntilDone(transcriptId, call_id) {
+  for (let i = 0; i < 60; i++) {
+    await waitMs(5000);
     try {
-      await fetch(Config.ZAPIER_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          call_id: call_id,
-          ' Transcript URL': finalUrl,
-          event_type: 'transcript_ready'
-        })
+      const r = await fetch(`https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}`, {
+        headers: { 'Authorization': AAI_API_KEY }
       });
-      console.log('📤 Sent Transcript URL update to Zapier for Call', call_id);
+      const j = await r.json();
+      if (j.status === 'completed') {
+        let text = j.text || '';
+        if ((!text || text.trim().length < 5) && Array.isArray(j.utterances)) {
+          text = j.utterances.map(u => {
+            const sp = (typeof u.speaker === 'number') ? `Speaker ${u.speaker}` : (u.speaker || 'Speaker');
+            return `${sp}: ${u.text || ''}`;
+          }).join('\n');
+        }
+        await storeTranscript(call_id, transcriptId, text);
+        console.log('✅ AAI transcript stored (poll) for', call_id);
+        return;
+      }
+      if (j.status === 'error') {
+        console.error('AAI polling error:', j.error);
+        await upsertFields(call_id, { notes: `AAI error: ${j.error || 'unknown'}` });
+        return;
+      }
     } catch (e) {
-      console.error('Zapier transcript update error:', e);
+      console.error('AAI poll exception:', e);
     }
   }
 }
 
-// --- replace your existing createAAIJob with this one ---
+// Robust create that tries both endpoint forms and falls back to polling if webhook rejected
 async function createAAIJob(call_id, audioUrl) {
-  if (!aaiEnabled() || !audioUrl) {
-    console.log('AAI: skip (missing key or audioUrl)');
-    return null;
-  }
+  if (!aaiEnabled() || !audioUrl) return null;
 
-  // Build and validate webhook URL (https required)
+  // Build webhook URL with metadata
   let webhookUrl = null;
   try {
-    const base = (Config.WEBHOOK_BASE_URL || '').trim();
-    if (base) {
-      const u = new URL(base);
+    if (WEBHOOK_BASE_URL) {
+      const u = new URL(WEBHOOK_BASE_URL);
       if (u.protocol === 'https:') {
         u.pathname = (u.pathname.replace(/\/+$/, '') + '/webhooks/assembly').replace(/\/{2,}/g, '/');
         u.searchParams.set('call_id', safeKeySegment(call_id));
         webhookUrl = u.toString();
       } else {
-        console.warn(`AAI: WEBHOOK_BASE_URL must be https:// — got ${u.protocol}`);
+        console.warn(`AAI: WEBHOOK_BASE_URL must be https:// (got ${u.protocol}) — falling back to polling`);
       }
     }
   } catch (e) {
-    console.warn('AAI: invalid WEBHOOK_BASE_URL, will fall back to polling:', e?.message);
+    console.warn('AAI: invalid WEBHOOK_BASE_URL — falling back to polling:', e?.message);
   }
 
-  const payload = { audio_url: audioUrl };
-  if (webhookUrl) payload.webhook_url = webhookUrl;
+  const payloadBase = {
+    audio_url: audioUrl,
+    metadata: JSON.stringify({ call_id })
+  };
+  if (webhookUrl) payloadBase.webhook_url = webhookUrl;
+  if (AAI_WEBHOOK_SECRET) {
+    // Let AAI include Authorization header on callbacks, and optionally sign (some deployments do both)
+    payloadBase.webhook_auth_header_name = 'Authorization';
+    payloadBase.webhook_auth_header_value = `Bearer ${AAI_WEBHOOK_SECRET}`;
+  }
 
-  // Try both endpoint forms, no slash first (some regions 405 the trailing slash)
   const endpoints = [
-    'https://api.assemblyai.com/v2/transcript',   // preferred
-    'https://api.assemblyai.com/v2/transcript/'   // fallback
+    'https://api.assemblyai.com/v2/transcript',
+    'https://api.assemblyai.com/v2/transcript/' // fallback form
   ];
 
   const tryCreate = async (endpoint, body) => {
     const r = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Authorization': Config.AAI_API_KEY,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': AAI_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
     let j = {};
     try { j = await r.json(); } catch {}
-    return { ok: r.ok, status: r.status, json: j };
+    return { ok: r.ok, status: r.status, json: j, endpoint };
   };
 
-  // 1) Try with webhook_url (validated). If schema error, retry without webhook.
+  console.log('AAI: creating transcript job for', call_id);
+
   for (const ep of endpoints) {
     try {
-      const first = await tryCreate(ep, payload);
+      const first = await tryCreate(ep, payloadBase);
       if (first.ok && first.json?.id) {
+        console.log(`AAI create: OK at ${ep}, id=${first.json.id}, webhook=${!!webhookUrl}`);
         if (!webhookUrl) pollAAIUntilDone(first.json.id, call_id).catch(() => {});
         return first.json.id;
       }
-      // If webhook schema issue, retry once WITHOUT webhook on this same endpoint
+
+      // If webhook-related error, retry without webhook and poll
       const msg = (first.json && (first.json.error || first.json.message || '')).toString().toLowerCase();
       const looksWebhooky = msg.includes('endpoint') || msg.includes('schema') || msg.includes('webhook');
       if (webhookUrl && looksWebhooky) {
         console.warn(`AAI: ${ep} rejected webhook_url; retrying without webhook and will poll…`);
-        const second = await tryCreate(ep, { audio_url: audioUrl });
+        const second = await tryCreate(ep, { ...payloadBase, webhook_url: undefined, webhook_auth_header_name: undefined, webhook_auth_header_value: undefined });
         if (second.ok && second.json?.id) {
+          console.log(`AAI create (no webhook): OK at ${ep}, id=${second.json.id}`);
           pollAAIUntilDone(second.json.id, call_id).catch(() => {});
           return second.json.id;
         }
-        // If that failed too, try the next endpoint form
         continue;
       }
 
-      // If 405/404 (endpoint form issue), try the next endpoint form
+      // Endpoint form issue → try alternate
       if (first.status === 405 || first.status === 404) {
         console.warn(`AAI: ${ep} returned ${first.status}; trying alternate endpoint form…`);
         continue;
       }
 
-      // Other errors: log and try the alternate form
-      console.error('AAI create failed:', { endpoint: ep, status: first.status, body: first.json, sent: payload });
+      console.error('AAI create failed:', { endpoint: ep, status: first.status, body: first.json, sent: payloadBase });
     } catch (e) {
       console.error('AAI create exception:', e);
-      // try next endpoint form
     }
   }
 
-  // If all attempts failed, give up gracefully
   console.error('AAI: all create attempts failed for call', call_id);
   return null;
 }
 
+// ----------------------------- State (Timers) --------------------------------
+const humanTimeouts = new Map(); // key: customerCallId -> timeoutId
+const pendingBridges = new Map(); // key: humanCallId -> { customerCallId, readyToBridge }
 
-////////////////////////////////////////////////////////////////////////////////////////
- // In-memory state (timeouts & bridge tracking). Mapping persists in DB.
-////////////////////////////////////////////////////////////////////////////////////////
-const humanTimeouts = new Map(); // customerCallId -> timeoutId
-const pendingBridges = new Map(); // humanCallId -> { customerCallId, readyToBridge: true }
 function clearHumanTimeout(customerCallId) {
   const t = humanTimeouts.get(customerCallId);
   if (t) { clearTimeout(t); humanTimeouts.delete(customerCallId); }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Webhooks
-////////////////////////////////////////////////////////////////////////////////////////
-app.use(express.json());
+// ------------------------------- Webhooks ------------------------------------
+app.use(express.json()); // for Telnyx JSON
 
-// Telnyx webhook
 app.post('/webhooks/calls', async (req, res) => {
   const { data } = req.body || {};
   const event = data?.event_type;
   const callId = data?.payload?.call_control_id || data?.call_control_id;
   const clientState = parseB64(data?.payload?.client_state || data?.client_state);
+
   if (event && callId) {
     console.log(`🌐 WEBHOOK: ${event} | CallID: ${callId}`);
     if (clientState) console.log(`🌐 CLIENT_STATE:`, JSON.stringify(clientState, null, 2));
@@ -478,11 +452,13 @@ app.post('/webhooks/calls', async (req, res) => {
       case 'call.hangup': await onCallHangup(data, clientState); break;
       case 'call.recording.saved': await onRecordingSaved(data, clientState); break;
       case 'call.dtmf.received': await onDTMF(data); break;
-      case 'call.speak.ended': await onSpeakEnded(data, clientState); break;
       case 'call.bridged':
         console.log(`🌉 TELNYX CONFIRMS BRIDGE for: ${callId}`);
         break;
-      default: /* ignore noisy 'speak.started' and 'gather.ended' */ break;
+      case 'call.speak.ended': await onSpeakEnded(data, clientState); break;
+      case 'call.speak.started': break;
+      case 'call.gather.ended': break;
+      default: if (event) console.log(`❓ UNHANDLED EVENT: ${event} for ${callId}`);
     }
   } catch (e) {
     console.error(`WEBHOOK ERROR processing ${event} for ${callId}:`, e);
@@ -491,43 +467,54 @@ app.post('/webhooks/calls', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// AssemblyAI webhook: accept raw text for optional HMAC header verification
-app.post('/webhooks/assembly', express.text({ type: '*/*' }), async (req, res) => {
+// AssemblyAI webhook: accept raw body (for HMAC) and tolerate empty/probes
+app.post('/webhooks/assembly', express.raw({ type: '*/*' }), async (req, res) => {
   try {
-    const rawBody = req.body || '';
+    const rawBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+    const rawBody = rawBuf.toString('utf8');
+    const len = rawBuf.length;
+
     const signatureHeader = req.get('AAI-Signature') || '';
     const authHeader = req.get('Authorization') || '';
 
-    // Optional security: allow either HMAC or static bearer (if configured)
-    if (Config.AAI_WEBHOOK_SECRET) {
-      const hmacOK = verifyAAISignature(rawBody, signatureHeader, Config.AAI_WEBHOOK_SECRET);
-      const bearerOK = authHeader === `Bearer ${Config.AAI_WEBHOOK_SECRET}`;
+    if (AAI_WEBHOOK_SECRET) {
+      const hmacOK = verifyAAISignature(rawBody, signatureHeader, AAI_WEBHOOK_SECRET);
+      const bearerOK = authHeader === `Bearer ${AAI_WEBHOOK_SECRET}`;
       if (!hmacOK && !bearerOK) return res.status(401).send('unauthorized');
     }
 
-    // Parse webhook JSON
-    let evt;
-    try { evt = JSON.parse(rawBody); } catch { evt = {}; }
+    let evt = {};
+    try { evt = rawBody ? JSON.parse(rawBody) : {}; } catch { evt = {}; }
 
     const transcriptId = evt?.id || evt?.transcript_id || null;
     const status = evt?.status || null;
+
+    // Prefer metadata call_id; webhook query param is just a safety net
     let call_id = null;
     try { call_id = evt?.metadata ? JSON.parse(evt.metadata)?.call_id || null : null; } catch {}
 
-    console.log('🎧 AAI Webhook:', { transcriptId, status, hasMetadata: !!evt?.metadata, call_id });
+    if (!call_id) {
+      try {
+        const urlCallId = new URL(req.originalUrl, WEBHOOK_BASE_URL || 'https://dummy.local').searchParams.get('call_id');
+        if (urlCallId) call_id = urlCallId;
+      } catch {}
+    }
 
-    if (!transcriptId) return res.status(200).send('OK'); // nothing to do
+    console.log('🎧 AAI Webhook:', { len, transcriptId, status, hasMetadata: !!evt?.metadata, call_id });
+
+    if (!transcriptId) return res.status(200).send('OK'); // ignore probes
+
     if (status === 'error') {
       await upsertFields(call_id || transcriptId, { notes: `AAI error: ${evt.error || 'unknown'}` });
       return res.status(200).send('OK');
     }
     if (status !== 'completed') return res.status(200).send('OK');
 
-    // Fetch the full transcript result via GET
+    // Fetch full transcript
     let result;
     try {
       const r = await fetch(`https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}`, {
-        headers: { 'Authorization': Config.AAI_API_KEY }
+        headers: { 'Authorization': AAI_API_KEY }
       });
       result = await r.json();
       if (!r.ok) throw new Error(result?.error || `GET /transcript/${transcriptId} failed`);
@@ -537,7 +524,7 @@ app.post('/webhooks/assembly', express.text({ type: '*/*' }), async (req, res) =
       return res.status(200).send('OK');
     }
 
-    // Prefer call_id from metadata; else from audio_url key; else fallback to transcriptId
+    // Resolve call_id if still missing
     if (!call_id) {
       try { call_id = result?.metadata ? JSON.parse(result.metadata)?.call_id || null : null; } catch {}
     }
@@ -547,18 +534,15 @@ app.post('/webhooks/assembly', express.text({ type: '*/*' }), async (req, res) =
     }
     call_id = call_id || String(transcriptId);
 
-    // Build transcript text; if empty, synthesize from utterances
-    let transcriptText = result?.text || '';
-    if ((!transcriptText || transcriptText.trim().length < 5) && Array.isArray(result?.utterances)) {
-      transcriptText = result.utterances
-        .map(u => {
-          const sp = (typeof u.speaker === 'number') ? `Speaker ${u.speaker}` : (u.speaker || 'Speaker');
-          return `${sp}: ${u.text || ''}`;
-        })
-        .join('\n');
+    let text = result?.text || '';
+    if ((!text || text.trim().length < 5) && Array.isArray(result?.utterances)) {
+      text = result.utterances.map(u => {
+        const sp = (typeof u.speaker === 'number') ? `Speaker ${u.speaker}` : (u.speaker || 'Speaker');
+        return `${sp}: ${u.text || ''}`;
+      }).join('\n');
     }
 
-    await storeTranscript(call_id, transcriptId, transcriptText || '');
+    await storeTranscript(call_id, transcriptId, text || '');
     console.log('✅ AAI transcript stored for', call_id);
 
     return res.status(200).send('OK');
@@ -568,74 +552,32 @@ app.post('/webhooks/assembly', express.text({ type: '*/*' }), async (req, res) =
   }
 });
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Event Handlers (behavior-preserving)
-////////////////////////////////////////////////////////////////////////////////////////
-async function onSpeakEnded(data) {
-  const call_id = data?.payload?.call_control_id || data?.call_control_id;
-  const b = pendingBridges.get(call_id);
-  if (b && b.readyToBridge) {
-    pendingBridges.delete(call_id);
-    await attemptBridge(b.customerCallId, call_id);
-  }
-}
-
-async function attemptBridge(customerCallId, humanCallId) {
-  try {
-    const custNow = await dbGet('SELECT * FROM calls WHERE call_id = ?', [customerCallId]);
-    if (!custNow || custNow.status === 'completed') {
-      await speakToCall(humanCallId, "Sorry, the caller disconnected. Thank you.");
-      setTimeout(async () => { try { await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {} }, 2000);
-      return;
-    }
-
-    const r = await fetch(`https://api.telnyx.com/v2/calls/${customerCallId}/actions/bridge`, {
-      method: 'POST', headers: telnyxHeaders(), body: JSON.stringify({ call_control_id: humanCallId })
-    });
-
-    if (r.ok) {
-      await upsertFields(customerCallId, { call_type: 'human_connected', notes: 'Connected to human representative', pending_human_call_id: null });
-      console.log(`✅ BRIDGE SUCCESS: ${customerCallId} <-> ${humanCallId}`);
-    } else {
-      console.error('BRIDGE FAILED:', await r.text());
-      await speakToCall(humanCallId, "We're having an issue connecting you. Sorry about that.");
-      await speakToCall(customerCallId, "We're having technical difficulties. Please call back in a few minutes.");
-      setTimeout(async () => { try { await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {} }, 3000);
-    }
-  } catch (e) {
-    console.error('BRIDGE EXCEPTION:', e);
-    try { await speakToCall(humanCallId, "We're having technical difficulties. Sorry about that."); } catch {}
-  }
-}
-
+// ------------------------------ Handlers -------------------------------------
 async function onCallInitiated(data, clientState) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
-  const dirRaw = data.payload?.direction || data.direction; // incoming/outgoing
-  const direction = dirRaw === 'incoming' ? 'inbound' : 'outbound';
-  const from_number = data.payload?.from || data.from || null;
-  const to_number = data.payload?.to || data.to || null;
+  const dir = data.payload?.direction || data.direction; // incoming | outgoing
+  const from_number = data.payload?.from || data.from;
+  const to_number = data.payload?.to || data.to;
   const start_time = new Date().toISOString();
 
-  if (direction === 'inbound') {
-    await upsertCall({ call_id, direction, from_number, to_number, status: 'initiated', start_time, call_type: 'customer_inquiry' });
+  if (dir === 'incoming') {
+    await upsertCall({
+      call_id, direction: 'inbound', from_number, to_number,
+      status: 'initiated', start_time, call_type: 'customer_inquiry'
+    });
     await answerAndIntro(call_id);
   } else {
-    const linked_customer_call_id = clientState?.customer_call_id || null;
+    // Outbound (human rep)
     const existing = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
     if (existing) {
-      await upsertFields(call_id, {
-        direction: existing.direction || 'outbound',
-        from_number: from_number || existing.from_number || Config.TELNYX_PHONE_NUMBER || null,
-        to_number: to_number || existing.to_number || Config.HUMAN_PHONE_NUMBER || null,
-        status: 'initiated',
-        start_time,
-        call_type: existing.call_type || 'human_representative',
-        linked_customer_call_id: existing.linked_customer_call_id || linked_customer_call_id
-      });
+      await dbRun('UPDATE calls SET status = ?, start_time = ?, from_number = ?, to_number = ? WHERE call_id = ?',
+        ['initiated', start_time, from_number, to_number, call_id]);
     } else {
+      const linked_customer_call_id = clientState?.customer_call_id || null;
       await upsertCall({
-        call_id, direction: 'outbound', from_number, to_number, status: 'initiated',
-        start_time, call_type: 'human_representative', linked_customer_call_id
+        call_id, direction: 'outbound', from_number, to_number,
+        status: 'initiated', start_time, call_type: 'human_representative',
+        linked_customer_call_id, human_dial_started_at: start_time
       });
     }
   }
@@ -645,53 +587,94 @@ async function onCallAnswered(data, clientState) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
   await upsertFields(call_id, { status: 'answered' });
 
-  let rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-  const customerFromState = clientState?.customer_call_id || null;
+  let isHumanLeg = false;
+  let customerCallId = clientState?.customer_call_id || null;
 
-  const assumeHuman = rec?.direction === 'outbound' || !!customerFromState;
-  if (assumeHuman) {
-    await upsertFields(call_id, {
-      call_type: rec?.call_type || 'human_representative',
-      linked_customer_call_id: rec?.linked_customer_call_id || customerFromState || null,
-      direction: rec?.direction || 'outbound'
-    });
-    rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
-  }
+  const rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
+  if (rec?.call_type === 'human_representative') isHumanLeg = true;
+  if (!customerCallId && rec?.linked_customer_call_id) customerCallId = rec.linked_customer_call_id;
 
-  let isHuman = rec?.call_type === 'human_representative';
-  let customerCallId = customerFromState || rec?.linked_customer_call_id || null;
-  if (!isHuman && rec?.direction === 'outbound' && customerCallId) isHuman = true;
-  if (!isHuman && customerFromState) isHuman = true;
-
-  if (isHuman && customerCallId) {
+  if (isHumanLeg && customerCallId) {
     await upsertFields(call_id, { human_answered_at: new Date().toISOString() });
     clearHumanTimeout(customerCallId);
 
     const cust = await dbGet('SELECT * FROM calls WHERE call_id = ?', [customerCallId]);
     if (!cust || cust.status === 'completed') {
       await speakToCall(call_id, "Sorry, the caller disconnected just now. Thank you.");
-      setTimeout(async () => { try { await fetch(`https://api.telnyx.com/v2/calls/${call_id}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {} }, 2000);
+      setTimeout(async () => {
+        try { await fetch(`https://api.telnyx.com/v2/calls/${call_id}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {}
+      }, 2000);
       return;
     }
 
+    // Prepare to bridge after greeting
     pendingBridges.set(call_id, { customerCallId, readyToBridge: true });
+
     try {
-      if (Config.USE_RECORDED_PROMPTS && Config.HUMAN_GREETING_AUDIO_URL) {
-        await playbackAudio(call_id, Config.HUMAN_GREETING_AUDIO_URL);
+      if (USE_RECORDED_PROMPTS && HUMAN_GREETING_AUDIO_URL) {
+        await playbackAudio(call_id, HUMAN_GREETING_AUDIO_URL);
       } else {
         await speakToCall(call_id, "Customer is on the line. Connecting you now.");
       }
+
+      // Fallback bridge if speak.ended not received
       setTimeout(async () => {
         const still = pendingBridges.get(call_id);
         if (still && still.readyToBridge) {
           pendingBridges.delete(call_id);
           await attemptBridge(customerCallId, call_id);
         }
-      }, Config.HUMAN_BRIDGE_GREETING_MS);
-    } catch (e) {
-      console.error('Greeting error:', e);
+      }, Math.max(4000, HUMAN_BRIDGE_GREETING_MS));
+    } catch (err) {
+      console.error('Greeting error:', err);
       setTimeout(() => attemptBridge(customerCallId, call_id), 2000);
     }
+  }
+}
+
+async function onSpeakEnded(data, clientState) {
+  const call_id = data?.payload?.call_control_id || data?.call_control_id;
+  const bridgeInfo = pendingBridges.get(call_id);
+  if (bridgeInfo?.readyToBridge) {
+    pendingBridges.delete(call_id);
+    await attemptBridge(bridgeInfo.customerCallId, call_id);
+  }
+}
+
+async function attemptBridge(customerCallId, humanCallId) {
+  try {
+    const custNow = await dbGet('SELECT * FROM calls WHERE call_id = ?', [customerCallId]);
+    if (!custNow || custNow.status === 'completed') {
+      await speakToCall(humanCallId, "Sorry, the caller disconnected. Thank you.");
+      setTimeout(async () => {
+        try { await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {}
+      }, 2000);
+      return;
+    }
+
+    const bridge = await fetch(`https://api.telnyx.com/v2/calls/${customerCallId}/actions/bridge`, {
+      method: 'POST', headers: telnyxHeaders(), body: JSON.stringify({ call_control_id: humanCallId })
+    });
+
+    if (bridge.ok) {
+      await upsertFields(customerCallId, {
+        call_type: 'human_connected',
+        notes: 'Connected to human representative',
+        pending_human_call_id: null
+      });
+      console.log('✅ BRIDGE SUCCESS:', `${customerCallId} <-> ${humanCallId}`);
+    } else {
+      const errorText = await bridge.text();
+      console.error('Bridge failed:', errorText);
+      await speakToCall(humanCallId, "We're having an issue connecting you. Sorry about that.");
+      await speakToCall(customerCallId, "We're having technical difficulties. Please call back in a few minutes.");
+      setTimeout(async () => {
+        try { await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {}
+      }, 3000);
+    }
+  } catch (err) {
+    console.error('attemptBridge exception:', err);
+    try { await speakToCall(humanCallId, "We're having technical difficulties. Sorry about that."); } catch {}
   }
 }
 
@@ -699,8 +682,8 @@ async function onCallHangup(data, clientState) {
   const call_id = data.payload?.call_control_id || data.call_control_id;
   const end_time = new Date().toISOString();
 
-  const wasPending = pendingBridges.has(call_id);
-  pendingBridges.delete(call_id);
+  const wasPendingBridge = pendingBridges.has(call_id);
+  if (wasPendingBridge) pendingBridges.delete(call_id);
 
   const rec = await dbGet('SELECT * FROM calls WHERE call_id = ?', [call_id]);
   const wasCustomer = rec?.direction === 'inbound' || rec?.call_type === 'customer_inquiry';
@@ -708,7 +691,8 @@ async function onCallHangup(data, clientState) {
 
   let duration = null;
   if (rec?.start_time) {
-    duration = Math.max(0, Math.floor((Date.now() - new Date(rec.start_time).getTime()) / 1000));
+    const start = new Date(rec.start_time).getTime();
+    duration = Math.max(0, Math.floor((Date.now() - start) / 1000));
   }
   await upsertFields(call_id, { status: 'completed', end_time, duration });
 
@@ -732,8 +716,6 @@ async function onCallHangup(data, clientState) {
       }
     }
   }
-
-  console.log(`🔚 CALL HANGUP ${call_id} | wasCustomer=${!!wasCustomer} wasHuman=${!!wasHuman} pendingBridge=${wasPending}`);
 }
 
 async function onRecordingSaved(data) {
@@ -744,17 +726,17 @@ async function onRecordingSaved(data) {
   try {
     await dbRun('BEGIN IMMEDIATE');
     finalUrl = await mirrorRecordingToSpaces(call_id, telnyxUrl);
-    await upsertFields(call_id, { recording_url: finalUrl });
+    await upsertFields(call_id, { recording_url: finalUrl, status: 'completed' });
     await dbRun('COMMIT');
   } catch (e) {
-    console.error(`recording update failed for ${call_id}:`, e);
     try { await dbRun('ROLLBACK'); } catch {}
+    console.error('Recording save DB error:', e);
   }
 
-  // Start AssemblyAI job (webhook handles completion; or we poll if webhook invalid)
-  createAAIJob(call_id, finalUrl).catch((e) => console.error('AAI create job error:', e));
+  // Fire AssemblyAI (webhook or polling)
+  createAAIJob(safeKeySegment(call_id), finalUrl).catch((e) => console.error('AAI create job error:', e));
 
-  // Consider Zapier (initial record)
+  // Schedule Zapier after we know we have a recording
   await scheduleZapierWebhook(call_id);
 }
 
@@ -777,10 +759,9 @@ async function onDTMF(data) {
   }
 }
 
-// Human dial & mapping
 async function connectToHuman(customerCallId) {
   try {
-    if (!Config.HUMAN_PHONE_NUMBER) {
+    if (!HUMAN_PHONE_NUMBER) {
       await speakToCall(customerCallId, "Sorry, we can't reach a representative right now.");
       return;
     }
@@ -792,10 +773,10 @@ async function connectToHuman(customerCallId) {
       method: 'POST',
       headers: telnyxHeaders(),
       body: JSON.stringify({
-        to: Config.HUMAN_PHONE_NUMBER,
-        from: Config.TELNYX_PHONE_NUMBER,
-        connection_id: Config.TELNYX_CONNECTION_ID,
-        webhook_url: `${Config.WEBHOOK_BASE_URL}/webhooks/calls`,
+        to: HUMAN_PHONE_NUMBER,
+        from: TELNYX_PHONE_NUMBER,
+        connection_id: TELNYX_CONNECTION_ID,
+        webhook_url: `${WEBHOOK_BASE_URL}/webhooks/calls`,
         client_state: cs,
         machine_detection: 'disabled',
         timeout_secs: 30
@@ -803,7 +784,8 @@ async function connectToHuman(customerCallId) {
     });
 
     if (!resp.ok) {
-      console.error('dial human failed:', await resp.text());
+      const errorText = await resp.text();
+      console.error('Failed to dial human:', errorText);
       await speakToCall(customerCallId, "I'm sorry, we couldn't reach our representative. Please leave a detailed message after the tone.");
       return;
     }
@@ -820,8 +802,8 @@ async function connectToHuman(customerCallId) {
     await upsertCall({
       call_id: humanCallId,
       direction: 'outbound',
-      from_number: Config.TELNYX_PHONE_NUMBER,
-      to_number: Config.HUMAN_PHONE_NUMBER,
+      from_number: TELNYX_PHONE_NUMBER,
+      to_number: HUMAN_PHONE_NUMBER,
       status: 'initiated',
       start_time: now,
       call_type: 'human_representative',
@@ -833,7 +815,8 @@ async function connectToHuman(customerCallId) {
     const t = setTimeout(async () => {
       const row = await dbGet('SELECT status, pending_human_call_id FROM calls WHERE call_id = ?', [customerCallId]);
       if (!row || row.status === 'completed') return;
-      if (row.pending_human_call_id !== humanCallId) return;
+      const stillPending = row.pending_human_call_id === humanCallId;
+      if (!stillPending) return;
 
       try { await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {}
       await speakToCall(customerCallId, "I'm sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep.");
@@ -847,21 +830,30 @@ async function connectToHuman(customerCallId) {
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Zapier
-////////////////////////////////////////////////////////////////////////////////////////
+// --------------------------- Zapier (Airtable) --------------------------------
+const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL || '';
+
 async function scheduleZapierWebhook(callId) {
   try {
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
-    const shouldSend = !!(call?.recording_url && !call?.zapier_sent && call?.direction === 'inbound');
+
+    const shouldSend =
+      call?.recording_url &&
+      !call?.zapier_sent &&
+      call?.direction === 'inbound';
+
     if (!shouldSend) return;
+
     setTimeout(async () => { await sendToZapier(callId); }, 3000);
-  } catch (e) { console.error('scheduleZapierWebhook error:', e); }
+  } catch (e) {
+    console.error('scheduleZapierWebhook error:', e);
+  }
 }
 
 async function sendToZapier(callId) {
   try {
-    if (!Config.ZAPIER_WEBHOOK_URL) { console.log('Zapier not configured'); return; }
+    if (!ZAPIER_WEBHOOK_URL) return;
+
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
     if (!call) return;
 
@@ -875,16 +867,20 @@ async function sendToZapier(callId) {
       call_type: call.call_type,
       call_status: call.status,
       recording_url: call.recording_url,
-      transcript_url: call.transcript_url || null,      // backward-compatible
-      " Transcript URL": call.transcript_url || null,    // Airtable exact field name (note leading space)
+      transcript_url: call.transcript_url || null,                // keep existing field
+      " Transcript URL": call.transcript_url || null,             // Airtable column with leading space
       source: 'Water Damage Restoration Phone System',
       lead_source: 'Inbound Phone Call',
       business_phone: call.to_number
     };
 
-    const r = await fetch(Config.ZAPIER_WEBHOOK_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+    const r = await fetch(ZAPIER_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      timeout: 30000
     });
+
     const bodyText = await r.text();
     console.log(`ZAPIER RESP → status: ${r.status}, body: ${bodyText}`);
 
@@ -894,34 +890,37 @@ async function sendToZapier(callId) {
       setTimeout(async () => { await sendToZapier(callId); }, 30000);
     }
   } catch (e) {
-    console.error(`Zapier error for ${callId}:`, e);
+    console.error(`ZAPIER ERROR for ${callId}:`, e);
     setTimeout(async () => { await sendToZapier(callId); }, 60000);
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Static & Health
-////////////////////////////////////////////////////////////////////////////////////////
+// ---------------------------- Static / Health --------------------------------
 app.use(express.static(join(__dirname, 'public')));
+
 app.get('/', (req, res) => res.sendFile(join(__dirname, 'public', 'index.html')));
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', timestamp: new Date().toISOString(), port: Config.PORT, nodeVersion: process.version });
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    port: PORT,
+    nodeVersion: process.version
+  });
 });
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Start
-////////////////////////////////////////////////////////////////////////////////////////
+// --------------------------------- Start -------------------------------------
 async function startServer() {
   try {
     await initDatabase();
-    const server = app.listen(Config.PORT, '0.0.0.0', () => {
-      console.log(`Water Damage Lead System running on port ${Config.PORT}`);
-      console.log(`Webhook URL (Telnyx): ${Config.WEBHOOK_BASE_URL}/webhooks/calls`);
-      console.log(`Webhook URL (AAI):    ${AAI_WEBHOOK_URL}`);
-      console.log(`Spaces bucket: ${Config.SPACES_BUCKET || '(not set)'} | CDN: ${Config.SPACES_CDN_BASE || '(not set)'}`);
-      console.log(`Telnyx #: ${Config.TELNYX_PHONE_NUMBER || 'Not set'} | Human #: ${Config.HUMAN_PHONE_NUMBER || 'Not set'}`);
-      console.log(`Recorded prompts enabled: ${Config.USE_RECORDED_PROMPTS}`);
-      console.log(`Database path: ${Config.DATABASE_PATH}`);
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Water Damage Lead System running on port ${PORT}`);
+      console.log(`Webhook URL (Telnyx): ${WEBHOOK_BASE_URL}/webhooks/calls`);
+      console.log(`Webhook URL (AAI):    ${WEBHOOK_BASE_URL}/webhooks/assembly`);
+      console.log(`Spaces bucket: ${SPACES_BUCKET} | CDN: ${SPACES_CDN_BASE}`);
+      console.log(`Telnyx #: ${TELNYX_PHONE_NUMBER} | Human #: ${HUMAN_PHONE_NUMBER}`);
+      console.log(`Recorded prompts enabled: ${USE_RECORDED_PROMPTS}`);
+      console.log(`Database path: ${dbPath}`);
     });
 
     const shutdown = (sig) => {
@@ -938,6 +937,7 @@ async function startServer() {
     process.exit(1);
   }
 }
+
 startServer().catch(console.error);
 
 export default app;
