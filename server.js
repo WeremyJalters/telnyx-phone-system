@@ -337,7 +337,7 @@ async function pollAAIUntilDone(transcriptId, call_id) {
 async function createAAIJob(call_id, audioUrl) {
   if (!aaiEnabled() || !audioUrl) return null;
 
-  // Build webhook URL with metadata
+  // Build webhook URL (https only). If anything looks off, we simply don't set it and we'll poll.
   let webhookUrl = null;
   try {
     if (WEBHOOK_BASE_URL) {
@@ -354,73 +354,88 @@ async function createAAIJob(call_id, audioUrl) {
     console.warn('AAI: invalid WEBHOOK_BASE_URL — falling back to polling:', e?.message);
   }
 
-  const payloadBase = {
+  const baseBody = {
     audio_url: audioUrl,
     metadata: JSON.stringify({ call_id })
   };
-  if (webhookUrl) payloadBase.webhook_url = webhookUrl;
+
+  if (webhookUrl) baseBody.webhook_url = webhookUrl;
   if (AAI_WEBHOOK_SECRET) {
-    // Let AAI include Authorization header on callbacks, and optionally sign (some deployments do both)
-    payloadBase.webhook_auth_header_name = 'Authorization';
-    payloadBase.webhook_auth_header_value = `Bearer ${AAI_WEBHOOK_SECRET}`;
+    baseBody.webhook_auth_header_name = 'Authorization';
+    baseBody.webhook_auth_header_value = `Bearer ${AAI_WEBHOOK_SECRET}`;
   }
 
+  // Try multiple endpoint spellings; some accounts still accept /transcripts
   const endpoints = [
     'https://api.assemblyai.com/v2/transcript',
-    'https://api.assemblyai.com/v2/transcript/' // fallback form
+    'https://api.assemblyai.com/v2/transcripts'
   ];
 
-  const tryCreate = async (endpoint, body) => {
+  const postJson = async (endpoint, body, label) => {
     const r = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Authorization': AAI_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    let j = {};
-    try { j = await r.json(); } catch {}
-    return { ok: r.ok, status: r.status, json: j, endpoint };
+    let text = await r.text();
+    let j = null;
+    try { j = JSON.parse(text); } catch { /* keep raw text for logging */ }
+    return { ok: r.ok, status: r.status, json: j, raw: text, endpoint, label };
   };
 
   console.log('AAI: creating transcript job for', call_id);
-
   for (const ep of endpoints) {
-    try {
-      const first = await tryCreate(ep, payloadBase);
-      if (first.ok && first.json?.id) {
-        console.log(`AAI create: OK at ${ep}, id=${first.json.id}, webhook=${!!webhookUrl}`);
-        if (!webhookUrl) pollAAIUntilDone(first.json.id, call_id).catch(() => {});
-        return first.json.id;
+    // 1) try with webhook (if we built one)
+    if (webhookUrl) {
+      const res1 = await postJson(ep, baseBody, 'with-webhook');
+      if (res1.ok && res1.json?.id) {
+        console.log(`AAI create OK at ${ep} (webhook), id=${res1.json.id}`);
+        return res1.json.id; // webhook will deliver transcript
       }
-
-      // If webhook-related error, retry without webhook and poll
-      const msg = (first.json && (first.json.error || first.json.message || '')).toString().toLowerCase();
-      const looksWebhooky = msg.includes('endpoint') || msg.includes('schema') || msg.includes('webhook');
-      if (webhookUrl && looksWebhooky) {
-        console.warn(`AAI: ${ep} rejected webhook_url; retrying without webhook and will poll…`);
-        const second = await tryCreate(ep, { ...payloadBase, webhook_url: undefined, webhook_auth_header_name: undefined, webhook_auth_header_value: undefined });
-        if (second.ok && second.json?.id) {
-          console.log(`AAI create (no webhook): OK at ${ep}, id=${second.json.id}`);
-          pollAAIUntilDone(second.json.id, call_id).catch(() => {});
-          return second.json.id;
-        }
-        continue;
+      const msg = (res1.json?.error || res1.json?.message || res1.raw || '').toString();
+      if (/endpoint|schema|webhook/i.test(msg)) {
+        console.warn(`AAI: ${ep} rejected webhook_url; will retry without webhook and poll…`);
+      } else if (res1.status === 401) {
+        console.error('AAI 401 Unauthorized. Check ASSEMBLYAI_API_KEY value.');
+        console.error('AAI RESP:', { status: res1.status, body: res1.raw });
+        return null;
+      } else {
+        console.warn('AAI create (webhook) failed:', { endpoint: ep, status: res1.status, body: res1.raw });
       }
-
-      // Endpoint form issue → try alternate
-      if (first.status === 405 || first.status === 404) {
-        console.warn(`AAI: ${ep} returned ${first.status}; trying alternate endpoint form…`);
-        continue;
-      }
-
-      console.error('AAI create failed:', { endpoint: ep, status: first.status, body: first.json, sent: payloadBase });
-    } catch (e) {
-      console.error('AAI create exception:', e);
     }
+
+    // 2) try without webhook (always poll on success)
+    const bodyNoHook = { ...baseBody };
+    delete bodyNoHook.webhook_url;
+    delete bodyNoHook.webhook_auth_header_name;
+    delete bodyNoHook.webhook_auth_header_value;
+
+    const res2 = await postJson(ep, bodyNoHook, 'no-webhook');
+    if (res2.ok && res2.json?.id) {
+      console.log(`AAI create OK at ${ep} (no webhook), id=${res2.json.id} — polling until done`);
+      pollAAIUntilDone(res2.json.id, call_id).catch(() => {});
+      return res2.json.id;
+    }
+
+    if (res2.status === 401) {
+      console.error('AAI 401 Unauthorized. Check ASSEMBLYAI_API_KEY value.');
+      console.error('AAI RESP:', { status: res2.status, body: res2.raw });
+      return null;
+    }
+
+    // some clusters send 404/405 when a specific path form is wrong; loop will try next ep
+    if (res2.status === 404 || res2.status === 405) {
+      console.warn(`AAI: ${ep} returned ${res2.status}; trying next endpoint form…`);
+      continue;
+    }
+
+    console.error('AAI create failed:', { endpoint: ep, status: res2.status, body: res2.raw, sent: bodyNoHook });
   }
 
   console.error('AAI: all create attempts failed for call', call_id);
   return null;
 }
+
 
 // ----------------------------- State (Timers) --------------------------------
 const humanTimeouts = new Map(); // key: customerCallId -> timeoutId
