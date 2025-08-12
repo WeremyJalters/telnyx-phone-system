@@ -1,6 +1,5 @@
 // server.js
-// Water Damage Lead System – Telnyx → Spaces → Zapier + AssemblyAI (webhook fetch)
-// Keeps existing behavior, adds safe filenames + webhook GET for transcript, minimal TXT upload.
+// Water Damage Lead System – Telnyx → Spaces → Zapier + AssemblyAI (webhook + polling fallback)
 
 import express from 'express';
 import { fileURLToPath } from 'url';
@@ -9,11 +8,11 @@ import sqlite3 from 'sqlite3';
 import crypto from 'crypto';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
-// Node 18+ has global fetch. If using older Node, install node-fetch and import it.
+// Node 18+ includes global fetch.
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Config
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -45,8 +44,6 @@ const Config = {
   // AssemblyAI
   AAI_API_KEY: process.env.ASSEMBLYAI_API_KEY || '',
   AAI_WEBHOOK_SECRET: process.env.ASSEMBLYAI_WEBHOOK_SECRET || '',
-  AAI_ENABLE_SUMMARY: String(process.env.ASSEMBLYAI_ENABLE_SUMMARY || 'false').toLowerCase() === 'true',
-  AAI_SPEAKER_COUNT: Number(process.env.ASSEMBLYAI_SPEAKER_COUNT || 0),
 
   // Zapier
   ZAPIER_WEBHOOK_URL: process.env.ZAPIER_WEBHOOK_URL || '',
@@ -57,9 +54,9 @@ const Config = {
 
 const app = express();
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Utilities
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 const aaiEnabled = () => !!Config.AAI_API_KEY;
 
 function telnyxHeaders() {
@@ -90,9 +87,9 @@ function verifyAAISignature(rawBody, signatureHeader, secret) {
   try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest)); } catch { return false; }
 }
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // S3 / Spaces
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 const S3 = new S3Client({
   region: Config.SPACES_REGION,
   endpoint: `https://${Config.SPACES_ENDPOINT}`,
@@ -109,9 +106,9 @@ async function putPublicObject(key, body, contentType, cache = 'public, max-age=
   return `${Config.SPACES_CDN_BASE}/${key}`;
 }
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Database (SQLite) with queued access
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 class DatabaseQueue {
   constructor() { this.q = []; this.processing = false; }
   execute(op) { return new Promise((resolve, reject) => { this.q.push({ op, resolve, reject }); this._run(); }); }
@@ -219,9 +216,9 @@ async function initDatabase() {
   console.log('Existing calls in DB:', count?.count || 0);
 }
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Telnyx helpers
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 async function playbackAudio(callId, audioUrl) {
   const r = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
     method: 'POST', headers: telnyxHeaders(), body: JSON.stringify({ audio_url: audioUrl })
@@ -294,9 +291,9 @@ async function answerAndIntro(callId) {
   } catch (e) { console.error(`answerAndIntro error for ${callId}:`, e); }
 }
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Spaces: mirror Telnyx recording
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 async function mirrorRecordingToSpaces(call_id, telnyxUrl) {
   if (!Config.SPACES_BUCKET || !Config.SPACES_CDN_BASE) return telnyxUrl;
   try {
@@ -313,66 +310,177 @@ async function mirrorRecordingToSpaces(call_id, telnyxUrl) {
   }
 }
 
-// -------------------------------------------------------------------------------------
-// AssemblyAI (webhook-based, GET fetch for transcript)
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
+// AssemblyAI (webhook-based, with validated webhook + fallback to polling)
+////////////////////////////////////////////////////////////////////////////////////////
 const AAI_WEBHOOK_URL = `${Config.WEBHOOK_BASE_URL}/webhooks/assembly`;
 
-async function createAAIJob(call_id, audioUrl) {
-  if (!aaiEnabled() || !audioUrl) return;
-
-  const payload = {
-    audio_url: audioUrl,
-    webhook_url: AAI_WEBHOOK_URL,
-    webhook_auth_header_name: Config.AAI_WEBHOOK_SECRET ? 'Authorization' : undefined,
-    webhook_auth_header_value: Config.AAI_WEBHOOK_SECRET ? `Bearer ${Config.AAI_WEBHOOK_SECRET}` : undefined,
-    speaker_labels: true,
-    entity_detection: true,
-    sentiment_analysis: true,
-    summarization: Config.AAI_ENABLE_SUMMARY,
-    content_safety: true,
-    pii_redaction: true,
-    redact_pii_audio: false,
-    redact_pii_policies: ['medical_process','person_name','phone_number','email_address','address'],
-    redact_pii_sub: 'entity_type',
-    speakers_expected: Config.AAI_SPEAKER_COUNT > 0 ? Config.AAI_SPEAKER_COUNT : undefined,
-    summary_model: Config.AAI_ENABLE_SUMMARY ? 'informative' : undefined,
-    summary_type: Config.AAI_ENABLE_SUMMARY ? 'bullets' : undefined,
-    metadata: JSON.stringify({ call_id })
-  };
-
-  try {
-    const r = await fetch('https://api.assemblyai.com/v2/transcript', {
-      method: 'POST',
-      headers: { 'Authorization': Config.AAI_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const j = await r.json();
-    if (!r.ok) {
-      console.error('AssemblyAI create error:', j);
-      await upsertFields(call_id, { notes: `AAI create error: ${j.error || r.status}` });
-      return;
+// Store transcript: upload minimal .txt to Spaces (if configured), else fallback to AAI URL
+async function storeTranscript(call_id, transcriptId, text) {
+  let txtUrl = null;
+  if (Config.SPACES_BUCKET && Config.SPACES_CDN_BASE) {
+    const key = `transcripts/${safeKeySegment(call_id)}.txt`;
+    try {
+      txtUrl = await putPublicObject(key, Buffer.from(text || '', 'utf8'), 'text/plain; charset=utf-8');
+    } catch (e) {
+      console.error('TXT upload failed:', e);
     }
-    console.log('AssemblyAI job created:', j.id);
-    await upsertFields(call_id, { notes: `AAI job ${j.id} created` });
-  } catch (e) {
-    console.error('AssemblyAI create exception:', e);
-    await upsertFields(call_id, { notes: `AAI create exception: ${e.message}` });
+  }
+  // if no Spaces URL, we can still provide a retrievable endpoint at AssemblyAI
+  const fallbackUrl = `https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}`;
+  const finalUrl = txtUrl || fallbackUrl;
+
+  await upsertFields(call_id, {
+    transcript: text || null,
+    transcript_url: finalUrl || null,
+    notes: `AAI complete (${transcriptId})`
+  });
+
+  // Optional follow-up Zap so Airtable gets the link even if initial Zap already ran
+  if (Config.ZAPIER_WEBHOOK_URL && finalUrl) {
+    try {
+      await fetch(Config.ZAPIER_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          call_id: call_id,
+          ' Transcript URL': finalUrl,
+          event_type: 'transcript_ready'
+        })
+      });
+      console.log('📤 Sent Transcript URL update to Zapier for Call', call_id);
+    } catch (e) {
+      console.error('Zapier transcript update error:', e);
+    }
   }
 }
 
-async function fetchAAITranscript(transcriptId) {
-  const r = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
-    headers: { 'Authorization': Config.AAI_API_KEY }
-  });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j?.error || `GET /transcript/${transcriptId} failed`);
-  return j; // includes .text, .utterances, .metadata, maybe .audio_url
+// Minimal, validated `webhook_url` + retry without webhook + polling fallback
+async function createAAIJob(call_id, audioUrl) {
+  if (!aaiEnabled() || !audioUrl) {
+    console.log('AAI: skip (missing key or audioUrl)');
+    return null;
+  }
+
+  // Validate & build webhook URL (https required)
+  let webhookUrl = null;
+  try {
+    const base = (Config.WEBHOOK_BASE_URL || '').trim();
+    if (base) {
+      const u = new URL(base);
+      if (u.protocol === 'https:') {
+        u.pathname = (u.pathname.replace(/\/+$/, '') + '/webhooks/assembly').replace(/\/{2,}/g, '/');
+        // Pass a safe call id as a convenience (we also include metadata server-side)
+        u.searchParams.set('call_id', safeKeySegment(call_id));
+        webhookUrl = u.toString();
+      } else {
+        console.warn(`AAI: WEBHOOK_BASE_URL must be https:// — got ${u.protocol}`);
+      }
+    }
+  } catch (e) {
+    console.warn('AAI: invalid WEBHOOK_BASE_URL, will fall back to polling:', e?.message);
+  }
+
+  // Minimal payload per docs
+  const payload = { audio_url: audioUrl };
+  if (webhookUrl) payload.webhook_url = webhookUrl;
+
+  const endpoint = 'https://api.assemblyai.com/v2/transcript/'; // trailing slash OK
+  let createJson = null;
+  try {
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': Config.AAI_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+    createJson = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      console.error('AAI create failed:', { status: r.status, body: createJson, sent: payload });
+
+      // Likely invalid webhook schema -> retry without webhook, then poll
+      const msg = (createJson && (createJson.error || createJson.message || '')).toString().toLowerCase();
+      const looksWebhooky = msg.includes('endpoint') || msg.includes('schema') || msg.includes('webhook');
+      if (webhookUrl && looksWebhooky) {
+        console.warn('AAI: retrying create WITHOUT webhook_url, will poll status…');
+        const r2 = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Authorization': Config.AAI_API_KEY,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ audio_url: audioUrl })
+        });
+        const j2 = await r2.json().catch(() => ({}));
+        if (!r2.ok || !j2.id) {
+          console.error('AAI create retry failed:', { status: r2.status, body: j2 });
+          return null;
+        }
+        pollAAIUntilDone(j2.id, call_id).catch(() => {});
+        return j2.id;
+      }
+      return null;
+    }
+  } catch (e) {
+    console.error('AAI create exception:', e);
+    return null;
+  }
+
+  if (!createJson?.id) {
+    console.error('AAI create returned no id:', createJson);
+    return null;
+  }
+
+  // If no webhook in use, poll in the background
+  if (!webhookUrl) {
+    pollAAIUntilDone(createJson.id, call_id).catch(() => {});
+  }
+
+  return createJson.id;
 }
 
-// -------------------------------------------------------------------------------------
-// In-memory state (timeouts & bridge tracking). Mapping persists in DB.
-// -------------------------------------------------------------------------------------
+// Polling fallback when no webhook (or webhook rejected)
+async function pollAAIUntilDone(transcriptId, call_id) {
+  try {
+    const fetchOnce = async () => {
+      const r = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
+        headers: { 'Authorization': Config.AAI_API_KEY }
+      });
+      return r.json();
+    };
+
+    let tries = 0;
+    while (tries < 60) { // ~5 minutes
+      const j = await fetchOnce();
+      if (j.status === 'completed') {
+        const text = j.text || (Array.isArray(j.utterances)
+          ? j.utterances.map(u => {
+              const sp = (typeof u.speaker === 'number') ? `Speaker ${u.speaker}` : (u.speaker || 'Speaker');
+              return `${sp}: ${u.text || ''}`;
+            }).join('\n')
+          : '');
+        await storeTranscript(call_id, transcriptId, text || '');
+        console.log(`AAI poll: completed for ${call_id}`);
+        return;
+      }
+      if (j.status === 'error') {
+        console.error('AAI poll error:', j.error || j);
+        return;
+      }
+      await waitMs(5000);
+      tries++;
+    }
+    console.warn(`AAI poll: timeout for ${call_id} (id=${transcriptId})`);
+  } catch (e) {
+    console.error('AAI poll exception:', e);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+ // In-memory state (timeouts & bridge tracking). Mapping persists in DB.
+////////////////////////////////////////////////////////////////////////////////////////
 const humanTimeouts = new Map(); // customerCallId -> timeoutId
 const pendingBridges = new Map(); // humanCallId -> { customerCallId, readyToBridge: true }
 function clearHumanTimeout(customerCallId) {
@@ -380,9 +488,9 @@ function clearHumanTimeout(customerCallId) {
   if (t) { clearTimeout(t); humanTimeouts.delete(customerCallId); }
 }
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Webhooks
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 app.use(express.json());
 
 // Telnyx webhook
@@ -451,23 +559,26 @@ app.post('/webhooks/assembly', express.text({ type: '*/*' }), async (req, res) =
     // Fetch the full transcript result via GET
     let result;
     try {
-      result = await fetchAAITranscript(transcriptId);
+      const r = await fetch(`https://api.assemblyai.com/v2/transcript/${encodeURIComponent(transcriptId)}`, {
+        headers: { 'Authorization': Config.AAI_API_KEY }
+      });
+      result = await r.json();
+      if (!r.ok) throw new Error(result?.error || `GET /transcript/${transcriptId} failed`);
     } catch (e) {
       console.error('AAI GET error:', e);
       await upsertFields(call_id || transcriptId, { notes: `AAI GET error: ${e.message}` });
       return res.status(200).send('OK');
     }
 
-    // Prefer call_id from webhook metadata; else from result.metadata; else fallback to transcriptId
+    // Prefer call_id from metadata; else from audio_url key; else fallback to transcriptId
     if (!call_id) {
       try { call_id = result?.metadata ? JSON.parse(result.metadata)?.call_id || null : null; } catch {}
     }
     if (!call_id && result?.audio_url) {
-      // best-effort: attempt to extract safe segment used in our key (recordings/<safe(call_id)>.mp3)
       const m = String(result.audio_url).match(/recordings\/([^/]+)\.mp3/i);
-      if (m && m[1]) call_id = m[1]; // this is the *safe* segment, may already be sanitized
+      if (m && m[1]) call_id = m[1];
     }
-    call_id = call_id || String(transcriptId); // final fallback
+    call_id = call_id || String(transcriptId);
 
     // Build transcript text; if empty, synthesize from utterances
     let transcriptText = result?.text || '';
@@ -480,41 +591,8 @@ app.post('/webhooks/assembly', express.text({ type: '*/*' }), async (req, res) =
         .join('\n');
     }
 
-    // Save TXT to Spaces (minimal)
-    let txtUrl = null;
-    if (Config.SPACES_BUCKET && Config.SPACES_CDN_BASE) {
-      const key = `transcripts/${safeKeySegment(call_id)}.txt`;
-      try {
-        txtUrl = await putPublicObject(key, Buffer.from(transcriptText || result?.text || '', 'utf8'), 'text/plain; charset=utf-8');
-      } catch (e) { console.error('TXT upload failed:', e); }
-    }
-
-    // Update DB with text + link
-    await upsertFields(call_id, {
-      transcript: transcriptText || result?.text || null,
-      transcript_url: txtUrl || null,
-      notes: `AAI complete (${transcriptId})`
-    });
-
-    console.log('✅ AAI transcript stored for', call_id, 'txt:', txtUrl);
-
-    // Optional follow-up Zap so Airtable gets the link even if the first Zap already ran
-    if (Config.ZAPIER_WEBHOOK_URL && txtUrl) {
-      try {
-        await fetch(Config.ZAPIER_WEBHOOK_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            call_id: call_id,
-            ' Transcript URL': txtUrl,
-            event_type: 'transcript_ready'
-          })
-        });
-        console.log('📤 Sent Transcript URL update to Zapier for Call', call_id);
-      } catch (e) {
-        console.error('Zapier transcript update error:', e);
-      }
-    }
+    await storeTranscript(call_id, transcriptId, transcriptText || '');
+    console.log('✅ AAI transcript stored for', call_id);
 
     return res.status(200).send('OK');
   } catch (e) {
@@ -523,9 +601,9 @@ app.post('/webhooks/assembly', express.text({ type: '*/*' }), async (req, res) =
   }
 });
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Event Handlers (behavior-preserving)
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 async function onSpeakEnded(data) {
   const call_id = data?.payload?.call_control_id || data?.call_control_id;
   const b = pendingBridges.get(call_id);
@@ -706,7 +784,7 @@ async function onRecordingSaved(data) {
     try { await dbRun('ROLLBACK'); } catch {}
   }
 
-  // Start AssemblyAI job (webhook handles completion)
+  // Start AssemblyAI job (webhook handles completion; or we poll if webhook invalid)
   createAAIJob(call_id, finalUrl).catch((e) => console.error('AAI create job error:', e));
 
   // Consider Zapier (initial record)
@@ -802,9 +880,9 @@ async function connectToHuman(customerCallId) {
   }
 }
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Zapier
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 async function scheduleZapierWebhook(callId) {
   try {
     const call = await dbGet('SELECT * FROM calls WHERE call_id = ?', [callId]);
@@ -854,18 +932,18 @@ async function sendToZapier(callId) {
   }
 }
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Static & Health
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 app.use(express.static(join(__dirname, 'public')));
 app.get('/', (req, res) => res.sendFile(join(__dirname, 'public', 'index.html')));
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString(), port: Config.PORT, nodeVersion: process.version });
 });
 
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 // Start
-// -------------------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////////////
 async function startServer() {
   try {
     await initDatabase();
