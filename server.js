@@ -204,9 +204,9 @@ async function playIVRMenu(callId) {
   if (USE_RECORDED_PROMPTS && MENU_AUDIO_URL) {
     await gatherUsingAudio(callId, MENU_AUDIO_URL, { min: 1, max: 1, timeoutMs: 12000, term: '#' });
   } else {
-    const menuText = "Thanks for calling our flood and water damage restoration team. " +
-      "Press 1 to be connected to a representative now. " +
-      "Press 2 to leave details and we'll call you back. " +
+    const menuText = "Thanks for calling Weather Pro Solutions, your flood and water damage restoration team. " +
+      "Press 1 to be connected with a team member. " +
+      "Press 2 to leave your information for an immediate call back. " +
       "You can also press 0 to reach a representative.";
     await gatherUsingSpeak(callId, menuText, { min: 1, max: 1, timeoutMs: 12000, term: '#' });
   }
@@ -760,7 +760,7 @@ async function onCallAnswered(data, clientState) {
       if (USE_RECORDED_PROMPTS && HUMAN_GREETING_AUDIO_URL) {
         await playbackAudio(call_id, HUMAN_GREETING_AUDIO_URL);
       } else {
-        await speakToCall(call_id, "Customer is on the line. Connecting you now.");
+        await speakToCall(call_id, " A Weather Pro Customer is on the line. Connecting you now.");
       }
 
       // Fallback bridge if speak.ended not received
@@ -906,7 +906,7 @@ async function onDTMF(data) {
   switch (digit) {
     case '1':
     case '0':
-      await speakToCall(callId, "Connecting you now. Please remain on the line while we dial our representative.");
+      await speakToCall(callId, "Please hold while we connect you with our team.");
       await connectToHuman(callId);
       break;
     case '2':
@@ -946,7 +946,7 @@ async function connectToHuman(customerCallId) {
     if (!resp.ok) {
       const errorText = await resp.text();
       console.error('Failed to dial human:', errorText);
-      await speakToCall(customerCallId, "I'm sorry, we couldn't reach our representative. Please leave a detailed message after the tone.");
+      await speakToCall(customerCallId, "I'm sorry, we couldn't connect you with one of our team members. Please leave a detailed message after the tone.");
       return;
     }
 
@@ -979,7 +979,7 @@ async function connectToHuman(customerCallId) {
       if (!stillPending) return;
 
       try { await fetch(`https://api.telnyx.com/v2/calls/${humanCallId}/actions/hangup`, { method: 'POST', headers: telnyxHeaders() }); } catch {}
-      await speakToCall(customerCallId, "I'm sorry, our representative is unavailable. Please leave your name, phone number, address, and details about the water damage after the beep.");
+      await speakToCall(customerCallId, "I'm sorry, we are currently helping another client. Please leave your name, phone number, address, and details about the water damage after the beep.");
       await upsertFields(customerCallId, { pending_human_call_id: null });
     }, 35000);
 
